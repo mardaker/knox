@@ -226,6 +226,7 @@ func NewSQLDB(sqlDB *sql.DB) (DB, error) {
 	var err error
 	_, err = sqlDB.Exec(sqlCreateKeys)
 	if err != nil {
+        fmt.Println("Could not create table")
 		return nil, err
 	}
 	db.getStmt, err = sqlDB.Prepare("SELECT id, acl, version_hash, versions, last_updated FROM secrets WHERE id=?")

@@ -156,6 +156,7 @@ func GetBackoffDuration(attempt int) time.Duration {
 // APIClient is an interface that talks to the knox server for key management.
 type APIClient interface {
 	GetKey(keyID string) (*Key, error)
+    GetAll() ([]Key, error)
 	CreateKey(keyID string, data []byte, acl ACL) (uint64, error)
 	GetKeys(keys map[string]string) ([]string, error)
 	DeleteKey(keyID string) error
@@ -231,6 +232,14 @@ func (c *HTTPClient) GetKey(keyID string) (*Key, error) {
 		return c.NetworkGetKey(keyID)
 	}
 	return key, err
+}
+
+// Gets all active keys which are Read accesible by user
+// Always work through network
+func (c *HTTPClient) GetAll() ([]Key, error) {
+	keys := []Key{}
+	err := c.getHTTPData("GET", "/v0/keyvalues/", nil, &keys)
+	return keys, err
 }
 
 // CacheGetKeyWithStatus gets the key with status from file system cache.
@@ -370,7 +379,7 @@ func (c *HTTPClient) getHTTPData(method string, path string, body url.Values, da
 
 	auth := c.AuthHandler()
 	if auth == "" {
-		return fmt.Errorf("No authentication data given. Use 'knox login' or set KNOX_USER_AUTH or KNOX_MACHINE_AUTH")
+		return fmt.Errorf("No authentication data given. Set KNOX_SSH_USER_AUTH=user@pass or enter through stdin")
 	}
 	// Get user from env variable and machine hostname from elsewhere.
 	r.Header.Set("Authorization", auth)

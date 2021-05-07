@@ -12,6 +12,7 @@ type KeyManager interface {
 	GetAllKeyIDs() ([]string, error)
 	GetUpdatedKeyIDs(map[string]string) ([]string, error)
 	GetKey(id string, status knox.VersionStatus) (*knox.Key, error)
+    GetAll() ([]knox.Key, error)
 	AddNewKey(*knox.Key) error
 	DeleteKey(id string) error
 	UpdateAccess(string, ...knox.Access) error
@@ -39,6 +40,23 @@ func (m *keyManager) GetAllKeyIDs() ([]string, error) {
 		output = append(output, k.ID)
 	}
 	return output, nil
+}
+
+func (m * keyManager) GetAll() ([]knox.Key, error) {
+	keys, err := m.db.GetAll()
+	if err != nil {
+		return nil, err
+	}
+    decrypted := []knox.Key{}
+	for _, k := range keys {
+        dk, err := m.cryptor.Decrypt(&k)
+        if err != nil {
+            return nil, fmt.Errorf("Error decrypting key: %s", err.Error())
+        }
+        dk.VersionList = knox.KeyVersionList{*dk.VersionList.GetPrimary()}
+        decrypted = append(decrypted, *dk)
+    }
+    return decrypted, nil
 }
 
 func (m *keyManager) GetUpdatedKeyIDs(versions map[string]string) ([]string, error) {

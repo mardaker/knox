@@ -22,6 +22,13 @@ var routes = [...]route{
 		},
 	},
 	{
+		method:  "GET",
+		id:      "getkeyvalues",
+		path:    "/v0/keyvalues/",
+		handler: getKeyValuesHandler,
+		parameters: []parameter{},
+	},
+	{
 		method:  "POST",
 		id:      "postkeys",
 		path:    "/v0/keys/",
@@ -130,6 +137,22 @@ func getKeysHandler(m KeyManager, principal knox.Principal, parameters map[strin
 		return nil, errF(knox.InternalServerErrorCode, err.Error())
 	}
 	return keys, nil
+}
+
+// getKeyValues returns all active key and value pairs Read accessibe by provided principal
+func getKeyValuesHandler(m KeyManager, principal knox.Principal, paramters map[string]string) (interface{}, *httpError) {
+	keys, getErr := m.GetAll()
+	if getErr != nil {
+		return nil, errF(knox.InternalServerErrorCode, getErr.Error())
+	}
+
+    output := []knox.Key{}
+    for _, k := range keys {
+        if principal.CanAccess(k.ACL, knox.Read) {
+            output = append(output, k)
+        }
+	}
+	return output, nil
 }
 
 // postKeysHandler creates a new key and stores it. It reads from the post data

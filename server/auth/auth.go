@@ -9,8 +9,10 @@ import (
 	"net/http"
 	"strings"
 	"time"
+    "net"
 
 	"github.com/pinterest/knox"
+    "golang.org/x/crypto/ssh"
 )
 
 // Provider is used for authenticating requests via the authentication decorator.
@@ -265,6 +267,49 @@ type GitHubOrgFormat []GitHubLoginFormat
 
 type httpClient interface {
 	Do(req *http.Request) (resp *http.Response, err error)
+}
+
+
+type SSHAuthorizationProvider struct {
+}
+
+// NewSSHAuthorizationProvider returns SSHAuthorizationProvider used to check 
+// user for current host
+func NewSSHAuthorizationProvider() *SSHAuthorizationProvider {
+	return &SSHAuthorizationProvider{}
+}
+
+// Version is set to 0 for SSHAuthorizationProvider
+func (p *SSHAuthorizationProvider) Version() byte {
+	return '0'
+}
+
+// Type is set to u for SSHAuthorizationProvider
+func (p *SSHAuthorizationProvider ) Type() byte {
+	return 'k'
+}
+
+// Authenticate
+func (p *SSHAuthorizationProvider) Authenticate(token string, r *http.Request) (knox.Principal, error) {
+    // Delimiter for user/pass separation expected '@'
+    s := strings.SplitN(token, "@", 2)
+    user := s[0]
+    pass := s[1]
+    config := &ssh.ClientConfig{
+		User: user,
+		Auth: []ssh.AuthMethod{ ssh.Password(pass) },
+		HostKeyCallback: ssh.HostKeyCallback(func(hostname string, remote net.Addr, key ssh.PublicKey) error { return nil }),
+	}
+    client, err := ssh.Dial("tcp", "192.168.19.47:22", config)
+    if err != nil {
+        return nil, fmt.Errorf("auth: %v", err)
+    }
+    client.Close()
+    // Hard coding every authorized user as a member of security-team group
+    // until we will implement user gorups
+    groups := []string{"security-team"}
+    fmt.Println("Authorization passed for user: ", user)
+    return NewUser(user, groups), nil
 }
 
 // IsUser returns true if the principal, or first principal in the case of mux, is a user.

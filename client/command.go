@@ -128,6 +128,7 @@ var commands = []*Command{
 
 	// These commands are related to key management by users.
 	cmdGetKeys,
+    cmdGetAll,
 	cmdGet,
 	cmdGetVersions,
 	cmdGetACL,
