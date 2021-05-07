@@ -170,5 +170,5 @@ func main() {
 		Client:      &http.Client{Transport: &http.Transport{TLSClientConfig: tlsConfig}},
 	}
 
-	client.Run(cli, &client.VisibilityParams{log.Printf, log.Printf, func(map[string]uint64) {}}, tokenEndpoint, clientID)
+	client.Run(cli, &client.VisibilityParams{log.Printf, log.Printf, func(map[string]uint64) {}}, tokenEndpoint, clientID, "")
 }
