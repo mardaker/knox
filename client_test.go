@@ -110,15 +110,10 @@ func isKnoxDaemonRunning() bool {
 	}
 
 	cmd := exec.Command("systemctl", "is-active", "--quiet", "knox")
-
 	var out bytes.Buffer
 	cmd.Stdout = &out
 	err := cmd.Run()
-	if err == nil {
-		return true
-	}
-
-	return false
+	return err == nil
 }
 
 func TestGetKey(t *testing.T) {
@@ -707,6 +702,9 @@ func TestGetInvalidKeys(t *testing.T) {
 }
 
 func TestNewFileClient(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("Test requires Linux with knox daemon infrastructure")
+	}
 	if isKnoxDaemonRunning() {
 		t.Skip("Knox daemon is running, skipping the test.")
 	}
