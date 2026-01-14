@@ -109,15 +109,10 @@ func isKnoxDaemonRunning() bool {
 	}
 
 	cmd := exec.Command("systemctl", "is-active", "--quiet", "knox")
-
 	var out bytes.Buffer
 	cmd.Stdout = &out
 	err := cmd.Run()
-	if err == nil {
-		return true
-	}
-
-	return false
+	return err == nil
 }
 
 func TestGetKey(t *testing.T) {
@@ -706,9 +701,6 @@ func TestGetInvalidKeys(t *testing.T) {
 }
 
 func TestNewFileClient(t *testing.T) {
-	// This is an integration test that executes the knox binary as a subprocess.
-	// It requires proper knox daemon infrastructure (e.g., /var/lib/knox/.registered)
-	// which is only available on Linux systems with knox properly installed.
 	if runtime.GOOS != "linux" {
 		t.Skip("Test requires Linux with knox daemon infrastructure")
 	}
