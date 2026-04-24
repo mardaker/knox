@@ -141,7 +141,7 @@ func getKeysHandler(m KeyManager, principal knox.Principal, parameters map[strin
 }
 
 // getKeyValues returns all active key and value pairs Read accessibe by provided principal
-func getKeyValuesHandler(m KeyManager, principal knox.Principal, paramters map[string]string) (interface{}, *httpError) {
+func getKeyValuesHandler(m KeyManager, principal knox.Principal, paramters map[string]string) (interface{}, *HTTPError) {
 	keys, getErr := m.GetAll()
 	if getErr != nil {
 		return nil, errF(knox.InternalServerErrorCode, getErr.Error())

@@ -124,11 +124,14 @@ func main() {
 			//auth.NewMTLSAuthProvider(certPool),
 			//auth.NewGitHubProvider(authTimeout),
 			//auth.NewSpiffeAuthProvider(certPool),
-            auth.NewSSHAuthorizationProvider(),
-		}),
+			auth.NewSSHAuthorizationProvider(),
+		}, nil),
 	}
 
-	r := server.GetRouter(cryptor, db, decorators)
+	r, err := server.GetRouter(cryptor, db, decorators, []server.Route{})
+	if err != nil {
+		errLogger.Fatal("Failed to create router: ", err)
+	}
 
 	http.Handle("/", r)
 

@@ -534,6 +534,13 @@ func (c *UncachedHTTPClient) UpdateVersion(keyID, versionID string, status Versi
 	return err
 }
 
+// GetAll gets all active keys readable by the current principal.
+func (c *UncachedHTTPClient) GetAll() ([]Key, error) {
+	keys := []Key{}
+	err := c.getHTTPData("GET", "/v0/keyvalues/", nil, &keys)
+	return keys, err
+}
+
 func (c *UncachedHTTPClient) getClient() (HTTP, error) {
 	if c.DefaultClient == nil {
 		c.DefaultClient = &http.Client{}

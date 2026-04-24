@@ -18,19 +18,19 @@ See also: knox get, knox create, knox daemon
 	`,
 }
 
-func runGetAll(cmd *Command, args []string) {
+func runGetAll(cmd *Command, args []string) *ErrorStatus {
 	keys, err := cli.GetAll()
 	if err != nil {
-		fatalf("Error getting all keys: %s", err.Error())
+		return &ErrorStatus{fmt.Errorf("Error getting all keys: %s", err.Error()), false}
 	}
-    simplified := make(map[string]string)
-    for _, k := range keys {
-        simplified[k.ID] = string(k.VersionList.GetPrimary().Data)
-    }
-    data, err := json.Marshal(simplified)
-    if err != nil {
-        fatalf(err.Error())
-    }
-    fmt.Printf("%s", string(data))
-    return
+	simplified := make(map[string]string)
+	for _, k := range keys {
+		simplified[k.ID] = string(k.VersionList.GetPrimary().Data)
+	}
+	data, err := json.Marshal(simplified)
+	if err != nil {
+		return &ErrorStatus{err, false}
+	}
+	fmt.Printf("%s", string(data))
+	return nil
 }

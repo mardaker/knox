@@ -330,6 +330,11 @@ func NewSSHAuthorizationProvider() *SSHAuthorizationProvider {
 	return &SSHAuthorizationProvider{}
 }
 
+// Name returns the provider name for SSHAuthorizationProvider
+func (p *SSHAuthorizationProvider) Name() string {
+	return "SSHAuthorizationProvider"
+}
+
 // Version is set to 0 for SSHAuthorizationProvider
 func (p *SSHAuthorizationProvider) Version() byte {
 	return '0'

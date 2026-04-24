@@ -94,58 +94,21 @@ func getConfig() (*Config) {
 
 // authHandler is used to generate an authentication header.
 // The server expects VersionByte + TypeByte + IDToPassToAuthHandler.
-func authHandler() string {
+func authHandler() (string, string, knox.HTTP) {
 	if s := os.Getenv("KNOX_SSH_USER_AUTH"); s != "" {
-        // For aarki the server uses underlying sshd for authentication and expects 
-        // Version + Type + username + : + password
-		return "0k" + s
+		// For aarki the server uses underlying sshd for authentication and expects
+		// Version + Type + username + : + password
+		return "0k" + s, "ssh", nil
 	}
-    // SSH authentication like above but prompts for user/pass
-    reader := bufio.NewReader(os.Stdin)
-    fmt.Print("Username: ")
-    username, _ := reader.ReadString('\n')
-    fmt.Print("Password: ")
-    bytes, _ := terminal.ReadPassword(int(syscall.Stdin))
-    password := string(bytes)
-    fmt.Print("\n")
-    return "0k" + strings.TrimSpace(username) + "@" + strings.TrimSpace(password)
-    // Disable other types of auth for now
-	//if s := os.Getenv("KNOX_USER_AUTH"); s != "" {
-	//	return "0u" + s
-	//}
-	//if s := os.Getenv("KNOX_MACHINE_AUTH"); s != "" {
-	//	c, _ := getCert()
-	//	x509Cert, err := x509.ParseCertificate(c.Certificate[0])
-	//	if err != nil {
-	//		return "0t" + s
-	//	}
-	//	if len(x509Cert.Subject.CommonName) > 0 {
-	//		return "0t" + x509Cert.Subject.CommonName
-	//	} else if len(x509Cert.DNSNames) > 0 {
-	//		return "0t" + x509Cert.DNSNames[0]
-	//	} else {
-	//		return "0t" + s
-	//	}
-	//}
-	//if s := os.Getenv("KNOX_SERVICE_AUTH"); s != "" {
-	//	return "0s" + s
-	//}
-
-	//u, err := user.Current()
-	//if err != nil {
-	//	return ""
-	//}
-	//d, err := ioutil.ReadFile(u.HomeDir + "/.knox_user_auth")
-	//if err != nil {
-	//	return ""
-	//}
-	//var authResp authTokenResp
-	//err = json.Unmarshal(d, &authResp)
-	//if err != nil {
-	//	return ""
-	//}
-
-	//return "0u" + authResp.AccessToken
+	// SSH authentication like above but prompts for user/pass
+	reader := bufio.NewReader(os.Stdin)
+	fmt.Print("Username: ")
+	username, _ := reader.ReadString('\n')
+	fmt.Print("Password: ")
+	bytes, _ := terminal.ReadPassword(int(syscall.Stdin))
+	password := string(bytes)
+	fmt.Print("\n")
+	return "0k" + strings.TrimSpace(username) + "@" + strings.TrimSpace(password), "ssh", nil
 }
 
 func main() {
@@ -161,14 +124,21 @@ func main() {
 		tlsConfig.Certificates = []tls.Certificate{cert}
 	}
 
-    config := getConfig()
+	config := getConfig()
 
+	authHandlers := []knox.AuthHandler{authHandler}
 	cli := &knox.HTTPClient{
-        Host:        config.ServerInfo.Name + ":" + config.ServerInfo.Port,
-		AuthHandler: authHandler,
-		KeyFolder:   keyFolder,
-		Client:      &http.Client{Transport: &http.Transport{TLSClientConfig: tlsConfig}},
+		KeyFolder:      keyFolder,
+		UncachedClient: knox.NewUncachedClient(config.ServerInfo.Name+":"+config.ServerInfo.Port, &http.Client{Transport: &http.Transport{TLSClientConfig: tlsConfig}}, authHandlers, ""),
 	}
 
-	client.Run(cli, &client.VisibilityParams{log.Printf, log.Printf, func(map[string]uint64) {}}, tokenEndpoint, clientID, "")
+	loginCommand := client.NewLoginCommand(clientID, tokenEndpoint, "", "", "", "")
+
+	client.Run(cli, &client.VisibilityParams{
+		Logf:           log.Printf,
+		Errorf:         log.Printf,
+		SummaryMetrics: func(map[string]uint64) {},
+		InvokeMetrics:  func(map[string]string) {},
+		GetKeyMetrics:  func(map[string]string) {},
+	}, loginCommand)
 }
