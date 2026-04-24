@@ -2,17 +2,19 @@ package knox
 
 import (
 	"bytes"
+	"context"
 	"crypto/tls"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
-	"io/ioutil"
 	"log"
 	"math/rand"
 	"net/http"
 	"net/url"
 	"os"
 	"os/exec"
+	"path"
 	"sync"
 	"time"
 )
@@ -23,6 +25,11 @@ const refresh = 10 * time.Second
 const baseBackoff = 50 * time.Millisecond
 const maxBackoff = 3 * time.Second
 const maxRetryAttempts = 3
+
+var (
+	errNoAuth           = errors.New("No authentication data given. Use 'knox login' or set KNOX_USER_AUTH or KNOX_MACHINE_AUTH")
+	errUnsuccessfulAuth = errors.New("Unsuccessful authorization. No attempted principals were able to perform the requested operation")
+)
 
 // Client is an interface for interacting with a specific knox key
 type Client interface {
@@ -49,12 +56,12 @@ func (c *fileClient) update() error {
 	var key Key
 	f, err := os.Open("/var/lib/knox/v0/keys/" + c.keyID)
 	if err != nil {
-		return fmt.Errorf("Knox key file err: %s", err.Error())
+		return fmt.Errorf("knox key file err: %w", err)
 	}
 	defer f.Close()
 	err = json.NewDecoder(f).Decode(&key)
 	if err != nil {
-		return fmt.Errorf("Knox json decode err: %s", err.Error())
+		return fmt.Errorf("knox json decode err: %w", err)
 	}
 	c.setValues(&key)
 	return nil
@@ -67,8 +74,8 @@ func (c *fileClient) setValues(key *Key) {
 	c.primary = string(key.VersionList.GetPrimary().Data)
 	ks := key.VersionList.GetActive()
 	c.active = make([]string, len(ks))
-	for _, kv := range ks {
-		c.active = append(c.active, string(kv.Data))
+	for i, kv := range ks {
+		c.active[i] = string(kv.Data)
 	}
 }
 
@@ -101,14 +108,14 @@ func NewFileClient(keyID string) (Client, error) {
 	}
 	err = json.Unmarshal(jsonKey, &key)
 	if err != nil {
-		return nil, fmt.Errorf("Knox json decode err: %s", err.Error())
+		return nil, fmt.Errorf("knox json decode err: %w", err)
 	}
 	c.setValues(&key)
 	go func() {
 		for range time.Tick(refresh) {
 			err := c.update()
 			if err != nil {
-				log.Println("Failed to update knox key ", err.Error())
+				log.Println("failed to update knox key:", err)
 			}
 		}
 	}()
@@ -133,12 +140,29 @@ func NewMock(primary string, active []string) Client {
 
 // Register registers the given keyName with knox. If the operation fails, it returns an error.
 func Register(keyID string) ([]byte, error) {
+	var stdout, stderr bytes.Buffer
+
+	// Note that we want to capture stdout/stderr separately, to make sure we don't mix
+	// the returned secret (stdout) with any errors or warning messages that might have
+	// been returned (stderr).
 	cmd := exec.Command("knox", "register", "-g", "-k", keyID)
-	output, err := cmd.CombinedOutput()
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+
+	err := cmd.Run()
 	if err != nil {
-		return nil, fmt.Errorf("error getting knox key: %s %v '%q'", keyID, err, output)
+		errorMsg := fmt.Sprintf("error getting knox key %s. error: %v", keyID, err)
+		if stdout.Len() > 0 {
+			errorMsg += ", stdout: '" + string(stdout.Bytes()) + "'"
+		}
+		if stderr.Len() > 0 {
+			errorMsg += ", stderr: '" + string(stderr.Bytes()) + "'"
+		}
+		return nil, errors.New(errorMsg)
 	}
-	return output, nil
+
+	// If the command succeeded, we assume that the secret was returned on stdout.
+	return stdout.Bytes(), nil
 }
 
 // GetBackoffDuration returns a time duration to sleep based on the attempt #.
@@ -165,7 +189,9 @@ type APIClient interface {
 	AddVersion(keyID string, data []byte) (uint64, error)
 	UpdateVersion(keyID, versionID string, status VersionStatus) error
 	CacheGetKey(keyID string) (*Key, error)
+	CacheGetKeyWithContext(ctx context.Context, keyID string) (*Key, error)
 	NetworkGetKey(keyID string) (*Key, error)
+	NetworkGetKeyWithContext(ctx context.Context, keyID string) (*Key, error)
 	GetKeyWithStatus(keyID string, status VersionStatus) (*Key, error)
 	CacheGetKeyWithStatus(keyID string, status VersionStatus) (*Key, error)
 	NetworkGetKeyWithStatus(keyID string, status VersionStatus) (*Key, error)
@@ -177,52 +203,78 @@ type HTTP interface {
 
 // HTTPClient is a client that uses HTTP to talk to Knox.
 type HTTPClient struct {
-	// Host is used as the host for http connections
-	Host string
-	//AuthHandler returns the authorization string for authenticating to knox. Users should be prefixed by 0u, machines by 0m. On fail, return empty string.
-	AuthHandler func() string
 	// KeyFolder is the location of cached keys on the file system. If empty, does not check for cached keys.
 	KeyFolder string
 	// Client is the http client for making network calls
-	Client HTTP
-	// Version is the current client version, useful for debugging and sent as a header
-	Version string
+	UncachedClient *UncachedHTTPClient
 }
 
+// AuthHandler represents an authentication method, clientOverride is optional and allows using a custom client
+// for the request. clientOverride is useful when using multiple TLS certs as different auth handlers.
+type AuthHandler func() (authToken string, authType string, clientOverride HTTP)
+
 // NewClient creates a new client to connect to talk to Knox.
-func NewClient(host string, client HTTP, authHandler func() string, keyFolder, version string) APIClient {
+// NOTE: passing multiple authHandlers can cause severe performance issues, use with caution.
+func NewClient(host string, client HTTP, authHandlers []AuthHandler, keyFolder, version string) APIClient {
 	return &HTTPClient{
-		Host:        host,
-		Client:      client,
-		AuthHandler: authHandler,
-		KeyFolder:   keyFolder,
-		Version:     version,
+		KeyFolder:      keyFolder,
+		UncachedClient: NewUncachedClient(host, client, authHandlers, version),
 	}
 }
 
 // CacheGetKey gets the key from file system cache.
 func (c *HTTPClient) CacheGetKey(keyID string) (*Key, error) {
+	return c.CacheGetKeyWithContext(context.Background(), keyID)
+}
+
+// CacheGetKeyWithContext gets the key from file system cache with context support.
+func (c *HTTPClient) CacheGetKeyWithContext(ctx context.Context, keyID string) (*Key, error) {
 	if c.KeyFolder == "" {
-		return nil, fmt.Errorf("No folder set for cached key.")
+		return nil, fmt.Errorf("no folder set for cached key")
 	}
-	path := c.KeyFolder + keyID
-	b, err := ioutil.ReadFile(path)
+
+	// Check context before file operations
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	default:
+	}
+
+	keyPath := path.Join(c.KeyFolder, keyID)
+	b, err := os.ReadFile(keyPath)
 	if err != nil {
 		return nil, err
 	}
-	k := Key{Path: path}
+
+	// Check context after file read but before JSON unmarshal
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	default:
+	}
+
+	k := Key{Path: keyPath}
 	err = json.Unmarshal(b, &k)
 	if err != nil {
 		return nil, err
 	}
+
+	// do not return the invalid format cached keys
+	if k.ID == "" || k.ACL == nil || k.VersionList == nil || k.VersionHash == "" {
+		return nil, fmt.Errorf("invalid key content for the cached key")
+	}
+
 	return &k, nil
 }
 
 // NetworkGetKey gets a knox key by keyID and only uses network without the caches.
 func (c *HTTPClient) NetworkGetKey(keyID string) (*Key, error) {
-	key := &Key{}
-	err := c.getHTTPData("GET", "/v0/keys/"+keyID+"/", nil, key)
-	return key, err
+	return c.UncachedClient.NetworkGetKey(keyID)
+}
+
+// NetworkGetKeyWithContext gets a knox key by keyID and only uses network without the caches, with context support.
+func (c *HTTPClient) NetworkGetKeyWithContext(ctx context.Context, keyID string) (*Key, error) {
+	return c.UncachedClient.NetworkGetKeyWithContext(ctx, keyID)
 }
 
 // GetKey gets a knox key by keyID.
@@ -245,14 +297,14 @@ func (c *HTTPClient) GetAll() ([]Key, error) {
 // CacheGetKeyWithStatus gets the key with status from file system cache.
 func (c *HTTPClient) CacheGetKeyWithStatus(keyID string, status VersionStatus) (*Key, error) {
 	if c.KeyFolder == "" {
-		return nil, fmt.Errorf("No folder set for cached key.")
+		return nil, fmt.Errorf("no folder set for cached key")
 	}
 	st, err := status.MarshalJSON()
 	if err != nil {
 		return nil, err
 	}
 	path := c.KeyFolder + keyID + "?status=" + string(st)
-	b, err := ioutil.ReadFile(path)
+	b, err := os.ReadFile(path)
 	if err != nil {
 		return nil, err
 	}
@@ -264,19 +316,10 @@ func (c *HTTPClient) CacheGetKeyWithStatus(keyID string, status VersionStatus) (
 	return &k, nil
 }
 
-// GetKeyWithStatus gets a knox key by keyID and given version status (always calls network).
+// NetworkGetKeyWithStatus gets a knox key by keyID and given version status (always calls network).
 func (c *HTTPClient) NetworkGetKeyWithStatus(keyID string, status VersionStatus) (*Key, error) {
 	// If clients need to know
-	d := url.Values{}
-	s, err := status.MarshalJSON()
-	if err != nil {
-		return nil, err
-	}
-	d.Set("status", string(s))
-
-	key := &Key{}
-	err = c.getHTTPData("GET", "/v0/keys/"+keyID+"/?status="+string(s), nil, key)
-	return key, err
+	return c.UncachedClient.NetworkGetKeyWithStatus(keyID, status)
 }
 
 // GetKeyWithStatus gets a knox key by keyID and status (leverages cache).
@@ -290,6 +333,134 @@ func (c *HTTPClient) GetKeyWithStatus(keyID string, status VersionStatus) (*Key,
 
 // CreateKey creates a knox key with given keyID data and ACL.
 func (c *HTTPClient) CreateKey(keyID string, data []byte, acl ACL) (uint64, error) {
+	return c.UncachedClient.CreateKey(keyID, data, acl)
+}
+
+// GetKeys gets all Knox (if empty map) or gets all keys in map that do not match key version hash.
+func (c *HTTPClient) GetKeys(keys map[string]string) ([]string, error) {
+	return c.UncachedClient.GetKeys(keys)
+}
+
+// DeleteKey deletes a key from Knox.
+func (c HTTPClient) DeleteKey(keyID string) error {
+	return c.UncachedClient.DeleteKey(keyID)
+}
+
+// GetACL gets a knox key by keyID.
+func (c *HTTPClient) GetACL(keyID string) (*ACL, error) {
+	return c.UncachedClient.GetACL(keyID)
+}
+
+// PutAccess will add an ACL rule to a specific key.
+func (c *HTTPClient) PutAccess(keyID string, a ...Access) error {
+	return c.UncachedClient.PutAccess(keyID, a...)
+}
+
+// AddVersion adds a key version to a specific key.
+func (c *HTTPClient) AddVersion(keyID string, data []byte) (uint64, error) {
+	return c.UncachedClient.AddVersion(keyID, data)
+}
+
+// UpdateVersion either promotes or demotes a specific key version.
+func (c *HTTPClient) UpdateVersion(keyID, versionID string, status VersionStatus) error {
+	return c.UncachedClient.UpdateVersion(keyID, versionID, status)
+}
+
+func (c *HTTPClient) getClient() (HTTP, error) {
+	if c.UncachedClient.DefaultClient == nil {
+		c.UncachedClient.DefaultClient = &http.Client{}
+	}
+	return c.UncachedClient.DefaultClient, nil
+}
+
+func (c *HTTPClient) getHTTPData(method string, path string, body url.Values, data interface{}) error {
+	return c.UncachedClient.getHTTPData(method, path, body, data)
+}
+
+// UncachedHTTPClient is a client that uses HTTP to talk to Knox without caching.
+type UncachedHTTPClient struct {
+	// Host is used as the host for http connections
+	Host string
+	//AuthHandlers contains a list of auth handlers which return the authorization string for authenticating to knox. Users should be prefixed by 0u, machines by 0m. On fail, return empty string.
+	AuthHandlers []AuthHandler
+	// DefaultClient is the http client for making network calls
+	DefaultClient HTTP
+	// Version is the current client version, useful for debugging and sent as a header
+	Version string
+}
+
+// NewUncachedClient creates a new uncached client to connect to talk to Knox.
+// NOTE: passing multiple authHandlers can cause severe performance issues, use with caution.
+func NewUncachedClient(host string, client HTTP, authHandlers []AuthHandler, version string) *UncachedHTTPClient {
+	return &UncachedHTTPClient{
+		Host:          host,
+		DefaultClient: client,
+		AuthHandlers:  authHandlers,
+		Version:       version,
+	}
+}
+
+// NetworkGetKey gets a knox key by keyID and only uses network without the caches.
+func (c *UncachedHTTPClient) NetworkGetKey(keyID string) (*Key, error) {
+	return c.NetworkGetKeyWithContext(context.Background(), keyID)
+}
+
+// NetworkGetKeyWithContext gets a knox key by keyID and only uses network without the caches, with context support.
+func (c *UncachedHTTPClient) NetworkGetKeyWithContext(ctx context.Context, keyID string) (*Key, error) {
+	key := &Key{}
+	err := c.getHTTPDataWithContext(ctx, "GET", "/v0/keys/"+keyID+"/", nil, key)
+	if err != nil {
+		return nil, err
+	}
+
+	// do not return the invalid format remote keys
+	if key.ID == "" || key.ACL == nil || key.VersionList == nil || key.VersionHash == "" {
+		return nil, fmt.Errorf("invalid key content for the remote key")
+	}
+
+	return key, err
+}
+
+// CacheGetKey acts same as NetworkGetKey for UncachedHTTPClient.
+func (c *UncachedHTTPClient) CacheGetKey(keyID string) (*Key, error) {
+	return c.CacheGetKeyWithContext(context.Background(), keyID)
+}
+
+// CacheGetKeyWithContext acts same as NetworkGetKeyWithContext for UncachedHTTPClient.
+func (c *UncachedHTTPClient) CacheGetKeyWithContext(ctx context.Context, keyID string) (*Key, error) {
+	return c.NetworkGetKeyWithContext(ctx, keyID)
+}
+
+// GetKey gets a knox key by keyID.
+func (c *UncachedHTTPClient) GetKey(keyID string) (*Key, error) {
+	return c.NetworkGetKey(keyID)
+}
+
+// CacheGetKeyWithStatus acts same as NetworkGetKeyWithStatus for UncachedHTTPClient.
+func (c *UncachedHTTPClient) CacheGetKeyWithStatus(keyID string, status VersionStatus) (*Key, error) {
+	return c.NetworkGetKeyWithStatus(keyID, status)
+}
+
+// NetworkGetKeyWithStatus gets a knox key by keyID and given version status (always calls network).
+func (c *UncachedHTTPClient) NetworkGetKeyWithStatus(keyID string, status VersionStatus) (*Key, error) {
+	// If clients need to know
+	s, err := status.MarshalJSON()
+	if err != nil {
+		return nil, err
+	}
+
+	key := &Key{}
+	err = c.getHTTPData("GET", "/v0/keys/"+keyID+"/?status="+string(s), nil, key)
+	return key, err
+}
+
+// GetKeyWithStatus gets a knox key by keyID and status (no cache).
+func (c *UncachedHTTPClient) GetKeyWithStatus(keyID string, status VersionStatus) (*Key, error) {
+	return c.NetworkGetKeyWithStatus(keyID, status)
+}
+
+// CreateKey creates a knox key with given keyID data and ACL.
+func (c *UncachedHTTPClient) CreateKey(keyID string, data []byte, acl ACL) (uint64, error) {
 	var i uint64
 	d := url.Values{}
 	d.Set("id", keyID)
@@ -304,7 +475,7 @@ func (c *HTTPClient) CreateKey(keyID string, data []byte, acl ACL) (uint64, erro
 }
 
 // GetKeys gets all Knox (if empty map) or gets all keys in map that do not match key version hash.
-func (c *HTTPClient) GetKeys(keys map[string]string) ([]string, error) {
+func (c *UncachedHTTPClient) GetKeys(keys map[string]string) ([]string, error) {
 	var l []string
 
 	d := url.Values{}
@@ -317,20 +488,20 @@ func (c *HTTPClient) GetKeys(keys map[string]string) ([]string, error) {
 }
 
 // DeleteKey deletes a key from Knox.
-func (c HTTPClient) DeleteKey(keyID string) error {
+func (c UncachedHTTPClient) DeleteKey(keyID string) error {
 	err := c.getHTTPData("DELETE", "/v0/keys/"+keyID+"/", nil, nil)
 	return err
 }
 
 // GetACL gets a knox key by keyID.
-func (c *HTTPClient) GetACL(keyID string) (*ACL, error) {
+func (c *UncachedHTTPClient) GetACL(keyID string) (*ACL, error) {
 	acl := &ACL{}
 	err := c.getHTTPData("GET", "/v0/keys/"+keyID+"/access/", nil, acl)
 	return acl, err
 }
 
 // PutAccess will add an ACL rule to a specific key.
-func (c *HTTPClient) PutAccess(keyID string, a ...Access) error {
+func (c *UncachedHTTPClient) PutAccess(keyID string, a ...Access) error {
 	d := url.Values{}
 	s, err := json.Marshal(a)
 	if err != nil {
@@ -342,7 +513,7 @@ func (c *HTTPClient) PutAccess(keyID string, a ...Access) error {
 }
 
 // AddVersion adds a key version to a specific key.
-func (c *HTTPClient) AddVersion(keyID string, data []byte) (uint64, error) {
+func (c *UncachedHTTPClient) AddVersion(keyID string, data []byte) (uint64, error) {
 	var i uint64
 	d := url.Values{}
 	d.Set("data", base64.StdEncoding.EncodeToString(data))
@@ -351,7 +522,7 @@ func (c *HTTPClient) AddVersion(keyID string, data []byte) (uint64, error) {
 }
 
 // UpdateVersion either promotes or demotes a specific key version.
-func (c *HTTPClient) UpdateVersion(keyID, versionID string, status VersionStatus) error {
+func (c *UncachedHTTPClient) UpdateVersion(keyID, versionID string, status VersionStatus) error {
 	d := url.Values{}
 	s, err := status.MarshalJSON()
 	if err != nil {
@@ -363,72 +534,139 @@ func (c *HTTPClient) UpdateVersion(keyID, versionID string, status VersionStatus
 	return err
 }
 
-func (c *HTTPClient) getClient() (HTTP, error) {
-	if c.Client == nil {
-		c.Client = &http.Client{}
+func (c *UncachedHTTPClient) getClient() (HTTP, error) {
+	if c.DefaultClient == nil {
+		c.DefaultClient = &http.Client{}
 	}
-	return c.Client, nil
+	return c.DefaultClient, nil
 }
 
-func (c *HTTPClient) getHTTPData(method string, path string, body url.Values, data interface{}) error {
-	r, err := http.NewRequest(method, "https://"+c.Host+path, bytes.NewBufferString(body.Encode()))
+func (c *UncachedHTTPClient) getHTTPData(method string, path string, body url.Values, data interface{}) error {
+	return c.getHTTPDataWithContext(context.Background(), method, path, body, data)
+}
 
-	if err != nil {
-		return err
+func (c *UncachedHTTPClient) getHTTPDataWithContext(ctx context.Context, method string, path string, body url.Values, data interface{}) error {
+	if len(c.AuthHandlers) == 0 {
+		return errNoAuth
 	}
 
-	auth := c.AuthHandler()
-	if auth == "" {
-		return fmt.Errorf("No authentication data given. Set KNOX_SSH_USER_AUTH=user@pass or enter through stdin")
-	}
-	// Get user from env variable and machine hostname from elsewhere.
-	r.Header.Set("Authorization", auth)
-	r.Header.Set("User-Agent", fmt.Sprintf("Knox_Client/%s", c.Version))
+	authRequestAttempted := false
+	attemptedAuthTypes := []string{}
 
-	if body != nil {
-		r.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-	}
+	for _, authHandler := range c.AuthHandlers {
+		// Check context before each auth handler attempt
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
+		}
 
-	cli, err := c.getClient()
-	if err != nil {
-		return err
-	}
+		authToken, authType, clientOverride := authHandler()
+		if authToken == "" {
+			continue
+		}
+		authRequestAttempted = true
+		attemptedAuthTypes = append(attemptedAuthTypes, authType)
 
-	// Contains retry logic if we decode a 500 error.
-	for i := 1; i <= maxRetryAttempts; i++ {
-		w, err := cli.Do(r)
+		// Create the request per authHandler to prevent body from being reused between requests.
+		// This is due to the body being non-reusable after the first read.
+		r, err := http.NewRequestWithContext(ctx, method, "https://"+c.Host+path, bytes.NewBufferString(body.Encode()))
 		if err != nil {
 			return err
 		}
+
+		// Get user from env variable and machine hostname from elsewhere.
+		r.Header.Set("Authorization", authToken)
+		r.Header.Set("User-Agent", fmt.Sprintf("Knox_Client/%s", c.Version))
+
+		if body != nil {
+			r.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+		}
+
+		var cli HTTP
+		if clientOverride != nil {
+			cli = clientOverride
+		} else {
+			cli, err = c.getClient()
+			if err != nil {
+				return err
+			}
+		}
+
 		resp := &Response{}
 		resp.Data = data
-		decoder := json.NewDecoder(w.Body)
-		err = decoder.Decode(resp)
-		if err != nil {
-			return err
-		}
-		if resp.Status != "ok" {
-			if (resp.Code != InternalServerErrorCode) || (i == maxRetryAttempts) {
-				return fmt.Errorf(resp.Message)
+		// Contains retry logic if we decode a 500 error.
+		for i := 1; i <= maxRetryAttempts; i++ {
+			// Check context before each retry attempt
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			default:
 			}
-			time.Sleep(GetBackoffDuration(i))
-		} else {
-			break
+
+			err = getHTTPResp(cli, r, resp)
+			if err != nil {
+				return err
+			}
+			if resp.Status != "ok" {
+				if resp.Code == UnauthorizedCode || resp.Code == UnauthenticatedCode {
+					// If we get a 401 or 403, we need to continue to a different auth handler.
+					break
+				} else {
+					// If the failure is non authentication related, retry if we got a 500.
+					if (resp.Code != InternalServerErrorCode) || (i == maxRetryAttempts) {
+						// If we get a 500, we need to retry the request.
+						return fmt.Errorf("%s", resp.Message)
+					}
+
+					// Check context before sleeping
+					backoffDuration := GetBackoffDuration(i)
+					timer := time.NewTimer(backoffDuration)
+					select {
+					case <-ctx.Done():
+						timer.Stop()
+						return ctx.Err()
+					case <-timer.C:
+						timer.Stop()
+						// Continue to retry
+					}
+				}
+			} else {
+				// If we got a successful response, we can return the data.
+				return nil
+			}
 		}
 	}
 
-	return nil
+	if !authRequestAttempted {
+		return errNoAuth
+	}
+
+	return fmt.Errorf("%w: attempted auth types: %v", errUnsuccessfulAuth, attemptedAuthTypes)
+}
+
+func getHTTPResp(cli HTTP, r *http.Request, resp *Response) error {
+	w, err := cli.Do(r)
+	if err != nil {
+		return err
+	}
+	defer w.Body.Close()
+
+	decoder := json.NewDecoder(w.Body)
+	return decoder.Decode(resp)
 }
 
 // MockClient builds a client that ignores certs and talks to the given host.
-func MockClient(host string) *HTTPClient {
+func MockClient(host, keyFolder string) *HTTPClient {
 	return &HTTPClient{
-		Host: host,
-		AuthHandler: func() string {
-			return "TESTAUTH"
+		KeyFolder: keyFolder,
+		UncachedClient: &UncachedHTTPClient{
+			Host: host,
+			AuthHandlers: []AuthHandler{func() (string, string, HTTP) {
+				return "TESTAUTH", "TESTAUTHTYPE", nil
+			}},
+			DefaultClient: &http.Client{Transport: &http.Transport{TLSClientConfig: &tls.Config{InsecureSkipVerify: true}}},
+			Version:       "mock",
 		},
-		KeyFolder: "",
-		Client:    &http.Client{Transport: &http.Transport{TLSClientConfig: &tls.Config{InsecureSkipVerify: true}}},
-		Version:   "mock",
 	}
 }

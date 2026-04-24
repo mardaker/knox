@@ -129,6 +129,11 @@ func TestPostKeys(t *testing.T) {
 		t.Fatal("Expected err")
 	}
 
+	_, err = postKeysHandler(m, u, map[string]string{"id": "a1", "data": ""})
+	if err == nil {
+		t.Fatal("Expected err")
+	}
+
 	j, err := postKeysHandler(m, u, map[string]string{"id": "a2", "data": "MQ==", "acl": "[]"})
 	if err != nil {
 		t.Fatalf("%+v is not nil", err)
@@ -152,6 +157,109 @@ func TestPostKeys(t *testing.T) {
 	_, err = postKeysHandler(m, u, map[string]string{"id": "a3", "data": "MQ=="})
 	if err == nil {
 		t.Fatal("Expected err")
+	}
+}
+
+func TestPostKeysServiceWithAuthorizer(t *testing.T) {
+	m, _ := makeDB()
+	svc := auth.NewService("example.com", "service/test-svc/v1")
+	machine := auth.NewMachine("test-machine")
+
+	// Without any authorizer installed, non-user principals are rejected
+	// (preserving the pre-existing user-only default).
+	_, err := postKeysHandler(m, svc, map[string]string{"id": "test:project:key1", "data": "MQ=="})
+	if err == nil {
+		t.Fatal("Expected err when no service authorizer is installed")
+	}
+
+	authz := &PrefixServiceKeyCreationAuthorizer{}
+	if addErr := authz.AddPolicy(ServiceKeyCreationPolicy{
+		SpiffePrefix: "spiffe://example.com/service/test-svc/",
+		KeyPrefix:    "test:project:",
+		Owner:        knox.Access{ID: "test-owners", Type: knox.UserGroup},
+		Metadata:     map[string]string{"project": "test-project"},
+	}); addErr != nil {
+		t.Fatalf("AddPolicy returned unexpected error: %v", addErr)
+	}
+	SetServiceKeyCreationAuthorizer(authz)
+	defer SetServiceKeyCreationAuthorizer(nil)
+
+	// Matching service + key prefix succeeds and the owner is recorded as admin.
+	i, err := postKeysHandler(m, svc, map[string]string{"id": "test:project:key1", "data": "MQ=="})
+	if err != nil {
+		t.Fatalf("Expected success for matching policy, got: %+v", err)
+	}
+	if _, ok := i.(uint64); !ok {
+		t.Fatalf("Expected uint64 version id, got %T", i)
+	}
+	k, kerr := m.GetKey("test:project:key1", knox.Active)
+	if kerr != nil {
+		t.Fatalf("Could not fetch newly created key: %v", kerr)
+	}
+	foundOwnerAdmin := false
+	for _, a := range k.ACL {
+		if a.ID == "test-owners" && a.Type == knox.UserGroup && a.AccessType == knox.Admin {
+			foundOwnerAdmin = true
+		}
+	}
+	if !foundOwnerAdmin {
+		t.Fatalf("Expected owner 'test-owners' to be Admin on ACL, got %+v", k.ACL)
+	}
+
+	// Non-matching key prefix is rejected.
+	_, err = postKeysHandler(m, svc, map[string]string{"id": "other:prefix:key", "data": "MQ=="})
+	if err == nil {
+		t.Fatal("Expected err for non-matching key prefix")
+	}
+
+	// Non-matching SPIFFE is rejected.
+	otherSvc := auth.NewService("example.com", "service/other-svc/v1")
+	_, err = postKeysHandler(m, otherSvc, map[string]string{"id": "test:project:key2", "data": "MQ=="})
+	if err == nil {
+		t.Fatal("Expected err for non-matching SPIFFE")
+	}
+
+	// Machine principals are always rejected.
+	_, err = postKeysHandler(m, machine, map[string]string{"id": "test:project:key3", "data": "MQ=="})
+	if err == nil {
+		t.Fatal("Expected err for machine principal")
+	}
+}
+
+func TestPrefixServiceKeyCreationAuthorizerRequiresOwner(t *testing.T) {
+	authz := &PrefixServiceKeyCreationAuthorizer{}
+	err := authz.AddPolicy(ServiceKeyCreationPolicy{
+		SpiffePrefix: "spiffe://example.com/service/test-svc/",
+		KeyPrefix:    "test:project:",
+	})
+	if err == nil {
+		t.Fatal("Expected AddPolicy to reject a policy with no Owner")
+	}
+}
+
+func TestPrefixServiceKeyCreationAuthorizerValidatesSpiffePrefix(t *testing.T) {
+	owner := knox.Access{ID: "test-owners", Type: knox.UserGroup}
+
+	cases := []struct {
+		name   string
+		prefix string
+	}{
+		{"empty", ""},
+		{"not a spiffe url", "http://example.com/service/"},
+		{"missing trailing slash", "spiffe://example.com/service/test-svc"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			authz := &PrefixServiceKeyCreationAuthorizer{}
+			err := authz.AddPolicy(ServiceKeyCreationPolicy{
+				SpiffePrefix: tc.prefix,
+				KeyPrefix:    "test:project:",
+				Owner:        owner,
+			})
+			if err == nil {
+				t.Fatalf("Expected AddPolicy to reject SpiffePrefix %q", tc.prefix)
+			}
+		})
 	}
 }
 
@@ -473,6 +581,11 @@ func TestPostVersion(t *testing.T) {
 		t.Fatal("Expected err")
 	}
 
+	_, err = postVersionHandler(m, u, map[string]string{"keyID": "a1", "data": ""})
+	if err == nil {
+		t.Fatal("Expected err")
+	}
+
 	_, err = postVersionHandler(m, u, map[string]string{"keyID": "NOTAKEYID", "data": "Mg=="})
 	if err == nil {
 		t.Fatal("Expected err")
@@ -597,4 +710,93 @@ func TestPutVersions(t *testing.T) {
 		t.Fatal("Expected err")
 	}
 
+}
+
+func TestAuthorizeRequest(t *testing.T) {
+	type input struct {
+		Key        *knox.Key
+		Principal  knox.Principal
+		AccessType knox.AccessType
+	}
+
+	type testCase struct {
+		Name               string
+		Input              input
+		CallBackImpl       func(input knox.AccessCallbackInput) (bool, error)
+		ExpectedAuthorized bool
+		ExpectedError      error
+	}
+
+	triggerCallBackInput := input{
+		Key:        &knox.Key{ID: "test", ACL: knox.ACL{{ID: "test", AccessType: knox.Read, Type: knox.User}}},
+		Principal:  auth.NewUser("test", []string{"returntrue"}),
+		AccessType: knox.Write,
+	}
+
+	testCases := []testCase{
+		{
+			Name:  "AccessCallback returns true",
+			Input: triggerCallBackInput,
+			CallBackImpl: func(input knox.AccessCallbackInput) (bool, error) {
+				return true, nil
+			},
+			ExpectedAuthorized: true,
+			ExpectedError:      nil,
+		},
+		{
+			Name:  "AccessCallback returns false",
+			Input: triggerCallBackInput,
+			CallBackImpl: func(input knox.AccessCallbackInput) (bool, error) {
+				return false, nil
+			},
+			ExpectedAuthorized: false,
+			ExpectedError:      nil,
+		},
+		{
+			Name:  "AccessCallback returns false with valid input",
+			Input: triggerCallBackInput,
+			CallBackImpl: func(input knox.AccessCallbackInput) (bool, error) {
+				return input.AccessType == knox.Write && input.Key.ACL[0].ID == "test" && input.Key.ACL[0].Type == knox.User, nil
+			},
+			ExpectedAuthorized: true,
+			ExpectedError:      nil,
+		},
+		{
+			Name:               "AccessCallback is nil",
+			Input:              triggerCallBackInput,
+			CallBackImpl:       nil,
+			ExpectedAuthorized: false,
+			ExpectedError:      nil,
+		},
+		{
+			Name:  "AccessCallback panics",
+			Input: triggerCallBackInput,
+			CallBackImpl: func(input knox.AccessCallbackInput) (bool, error) {
+				panic("intentional panic")
+			},
+			ExpectedAuthorized: false,
+			ExpectedError:      fmt.Errorf("recovered from panic in access callback: intentional panic"),
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.Name, func(t *testing.T) {
+			defer SetAccessCallback(nil)
+
+			SetAccessCallback(tc.CallBackImpl)
+			authorized, err := authorizeRequest(tc.Input.Key, tc.Input.Principal, tc.Input.AccessType)
+			if err != nil {
+				if err.Error() == tc.ExpectedError.Error() {
+					if authorized != tc.ExpectedAuthorized {
+						t.Fatalf("Expected %v, got %v", tc.ExpectedAuthorized, authorized)
+					}
+				} else {
+					t.Fatalf("Got err: %v", err)
+				}
+			}
+			if authorized != tc.ExpectedAuthorized {
+				t.Fatalf("Expected %v, got %v", tc.ExpectedAuthorized, authorized)
+			}
+		})
+	}
 }

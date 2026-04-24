@@ -2,6 +2,7 @@ package client
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strconv"
 
@@ -13,7 +14,7 @@ func init() {
 }
 
 var cmdGet = &Command{
-	UsageLine: "get [-v key_version] [-n] [-j] [-a] <key_identifier>",
+	UsageLine: "get [-v key_version] [-n] [-j] [-a] [--tink-keyset] [--tink-keyset-info] <key_identifier>",
 	Short:     "get a knox key",
 	Long: `
 Get gets the key data for a key.
@@ -22,6 +23,8 @@ Get gets the key data for a key.
 -j returns the json version of the key as specified in the knox API.
 -n forces a network call. This will avoid cache issues where the ACL is out of date.
 -a returns all key versions (including inactive ones). Only works when -j is specified.
+--tink-keyset retrieve all the primary and active versions of this identifier in knox, combine them, and return one tink keyset. Force to retrieve tink keyset if -n is specified.
+--tink-keyset-info retrieves keyset metadata for primary and active versions without revealing the secret keys. Force to retrieve tink keyset metadata if -n is specified.
 
 This requires read access to the key.
 
@@ -34,15 +37,53 @@ var getVersion = cmdGet.Flag.String("v", "", "")
 var getJSON = cmdGet.Flag.Bool("j", false, "")
 var getNetwork = cmdGet.Flag.Bool("n", false, "")
 var getAll = cmdGet.Flag.Bool("a", false, "")
+var getTinkKeyset = cmdGet.Flag.Bool("tink-keyset", false, "get the stored tink keyset of the given knox identifier entirely")
+var getTinkKeysetInfo = cmdGet.Flag.Bool("tink-keyset-info", false, "get the metadata of the stored tink keyset of the given knox identifier")
 
-func runGet(cmd *Command, args []string) {
+func successGetKeyMetric(keyID string) {
+	clientGetKeyMetrics(map[string]string{
+		"key_id":         keyID,
+		"access_result":  "success",
+		"failure_reason": "",
+	})
+}
+
+func failureGetKeyMetric(keyID string, err error) {
+	clientGetKeyMetrics(map[string]string{
+		"key_id":         keyID,
+		"access_result":  "failure",
+		"failure_reason": err.Error(),
+	})
+}
+
+func runGet(cmd *Command, args []string) *ErrorStatus {
 	if len(args) != 1 {
-		fatalf("get takes only one argument. See 'knox help get'")
+		return &ErrorStatus{fmt.Errorf("get takes only one argument; see 'knox help get'"), false}
 	}
 	keyID := args[0]
 
 	var err error
 	var key *knox.Key
+	if *getTinkKeyset {
+		tinkKeysetInBytes, err := retrieveTinkKeyset(keyID, *getNetwork)
+		if err != nil {
+			failureGetKeyMetric(keyID, err)
+			return err
+		}
+		fmt.Printf("%s", string(tinkKeysetInBytes))
+		successGetKeyMetric(keyID)
+		return nil
+	}
+	if *getTinkKeysetInfo {
+		tinkKeysetInfo, err := retrieveTinkKeysetInfo(keyID, *getNetwork)
+		if err != nil {
+			failureGetKeyMetric(keyID, err)
+			return err
+		}
+		fmt.Println(tinkKeysetInfo)
+		successGetKeyMetric(keyID)
+		return nil
+	}
 	if *getAll {
 		// By specifying status as inactive, we can get all key versions (active + inactive + primary)
 		// from knox server
@@ -59,26 +100,85 @@ func runGet(cmd *Command, args []string) {
 		}
 	}
 	if err != nil {
-		fatalf("Error getting key: %s", err.Error())
+		failureGetKeyMetric(keyID, err)
+		return &ErrorStatus{fmt.Errorf("error getting key: %w", err), true}
 	}
 	if *getJSON {
 		data, err := json.Marshal(key)
 		if err != nil {
-			fatalf(err.Error())
+			failureGetKeyMetric(keyID, err)
+			return &ErrorStatus{err, true}
 		}
 		fmt.Printf("%s", string(data))
-		return
+		successGetKeyMetric(keyID)
+		return nil
 	}
-	if *getVersion == "" {
-		fmt.Printf("%s", string(key.VersionList.GetPrimary().Data))
-		return
-	}
-	for _, v := range key.VersionList {
-		if strconv.FormatUint(v.ID, 10) == *getVersion {
-			fmt.Printf("%s", string(v.Data))
-			return
+	if key.VersionList != nil {
+		if *getVersion == "" {
+			fmt.Printf("%s", string(key.VersionList.GetPrimary().Data))
+			successGetKeyMetric(keyID)
+			return nil
+		}
+		for _, v := range key.VersionList {
+			if strconv.FormatUint(v.ID, 10) == *getVersion {
+				fmt.Printf("%s", string(v.Data))
+				successGetKeyMetric(keyID)
+				return nil
+			}
 		}
 	}
-	fatalf("Key version not found.")
+	failureGetKeyMetric(keyID, errors.New("key version not found"))
+	return &ErrorStatus{fmt.Errorf("key version not found"), false}
+}
 
+func retrieveTinkKeyset(keyID string, getFromNetwork bool) ([]byte, *ErrorStatus) {
+	if !isIDforTinkKeyset(keyID) {
+		return nil, &ErrorStatus{fmt.Errorf("this knox identifier is not for a tink keyset"), false}
+	}
+	// get the primary and all active versions of this knox identifier.
+	var primaryAndActiveVersions *knox.Key
+	var err error
+	if getFromNetwork {
+		primaryAndActiveVersions, err = cli.NetworkGetKey(keyID)
+	} else {
+		primaryAndActiveVersions, err = cli.GetKey(keyID)
+	}
+	if err != nil {
+		return nil, &ErrorStatus{fmt.Errorf("error getting key: %w", err), true}
+	}
+	keysetHandle, _, err := getTinkKeysetHandleFromKnoxVersionList(primaryAndActiveVersions.VersionList)
+	if err != nil {
+		return nil, &ErrorStatus{err, false}
+	}
+	tinkKeysetInBytes, err := convertTinkKeysetHandleToBytes(keysetHandle)
+	if err != nil {
+		return nil, &ErrorStatus{err, false}
+	}
+	return tinkKeysetInBytes, nil
+}
+
+func retrieveTinkKeysetInfo(keyID string, getFromNetwork bool) (string, *ErrorStatus) {
+	if !isIDforTinkKeyset(keyID) {
+		return "", &ErrorStatus{fmt.Errorf("this knox identifier is not for a tink keyset"), false}
+	}
+	// get the primary and all active versions of this knox identifier.
+	var primaryAndActiveVersions *knox.Key
+	var err error
+	if getFromNetwork {
+		primaryAndActiveVersions, err = cli.NetworkGetKey(keyID)
+	} else {
+		primaryAndActiveVersions, err = cli.GetKey(keyID)
+	}
+	if err != nil {
+		return "", &ErrorStatus{fmt.Errorf("error getting key: %w", err), true}
+	}
+	keysetHandle, tinkKeyIDToKnoxVersionID, err := getTinkKeysetHandleFromKnoxVersionList(primaryAndActiveVersions.VersionList)
+	if err != nil {
+		return "", &ErrorStatus{err, false}
+	}
+	tinkKeysetInfo, err := getKeysetInfoFromTinkKeysetHandle(keysetHandle, tinkKeyIDToKnoxVersionID)
+	if err != nil {
+		return "", &ErrorStatus{err, false}
+	}
+	return tinkKeysetInfo, nil
 }

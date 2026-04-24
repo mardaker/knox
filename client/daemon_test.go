@@ -3,7 +3,6 @@ package client
 import (
 	"encoding/json"
 	"io"
-	"io/ioutil"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -84,11 +83,11 @@ func setUpTest(t *testing.T) (*returnParameters, string, daemon) {
 	if err := setGoodResponse(&params, ""); err != nil {
 		t.Fatal("failed to initialize response params: " + err.Error())
 	}
-	dir, err := ioutil.TempDir("", "knox-test")
+	dir, err := os.MkdirTemp("", "knox-test")
 	if err != nil {
 		t.Fatal("Failed to create temp directory: " + err.Error())
 	}
-	cli := knox.MockClient(addr)
+	cli := knox.MockClient(addr, "")
 	cli.KeyFolder = dir + keysDir
 	d := daemon{
 		dir:          dir,
@@ -104,6 +103,90 @@ func setUpTest(t *testing.T) (*returnParameters, string, daemon) {
 
 func TearDownTest(dir string) {
 	os.RemoveAll(dir)
+}
+
+func TestChmodIfNeeded(t *testing.T) {
+	dir, err := os.MkdirTemp("", "knox-chmod-test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(dir)
+
+	tests := []struct {
+		name     string
+		setup    func() string // returns path to chmod
+		wantPerm os.FileMode
+	}{
+		{"skips when dir perms match", func() string {
+			os.Chmod(dir, 0777)
+			return dir
+		}, 0777},
+		{"skips when file perms match", func() string {
+			f := path.Join(dir, "f")
+			os.WriteFile(f, []byte{}, 0666)
+			return f
+		}, 0666},
+		{"chmods when perms differ", func() string {
+			f := path.Join(dir, "g")
+			os.WriteFile(f, []byte{}, 0600)
+			return f
+		}, 0666},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			path := tt.setup()
+			want := tt.wantPerm
+			if want == 0666 {
+				err = chmodIfNeeded(path, defaultFilePermission)
+			} else {
+				err = chmodIfNeeded(path, defaultDirPermission)
+			}
+			if err != nil {
+				t.Fatalf("chmodIfNeeded: %v", err)
+			}
+			info, _ := os.Stat(path)
+			if got := info.Mode().Perm(); got != want {
+				t.Errorf("perms: got %o, want %o", got, want)
+			}
+		})
+	}
+}
+
+func TestEnsureDirExists(t *testing.T) {
+	dir, err := os.MkdirTemp("", "knox-ensure-test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(dir)
+
+	tests := []struct {
+		name    string
+		setup   func() string
+		wantErr bool
+	}{
+		{"creates when missing", func() string { return path.Join(dir, "a", "b") }, false},
+		{"succeeds when already exists", func() string {
+			target := path.Join(dir, "existing")
+			os.MkdirAll(target, 0700)
+			return target
+		}, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			target := tt.setup()
+			err := ensureDirExists(target, 0755)
+			if (err != nil) != tt.wantErr {
+				t.Fatalf("ensureDirExists: err=%v, wantErr=%v", err, tt.wantErr)
+			}
+			info, err := os.Stat(target)
+			if err != nil {
+				t.Fatalf("stat: %v", err)
+			}
+			if !info.IsDir() {
+				t.Error("path is not a directory")
+			}
+		})
+	}
 }
 
 func TestProcessKey(t *testing.T) {
@@ -177,6 +260,49 @@ func TestProcessKey(t *testing.T) {
 	}
 	if ret.VersionHash != expected.VersionHash {
 		t.Fatalf("%s does not equal %s", ret.VersionHash, expected.VersionHash)
+	}
+}
+
+func TestProcessTinkKey(t *testing.T) {
+	params, dir, d := setUpTest(t)
+	defer TearDownTest(dir)
+	expectedTinkKeysetStr := "EmQKWAowdHlwZS5nb29nbGVhcGlzLmNvbS9nb29nbGUuY3J5cHRvLnRpbmsuQWVzR2NtS2V5EiIaIKMfoRISDw+QlZv88fJdP5qQG6sQdX79v6d5rMAi1JFtGAEQARjLvc6/AyAB"
+	var keyVersion knox.KeyVersion
+	keyVersion.ID = 1234567890
+	keyVersion.Data = []byte{8, 203, 189, 206, 191, 3, 18, 100, 10, 88, 10, 48, 116, 121, 112, 101, 46, 103, 111, 111, 103, 108, 101, 97, 112, 105, 115, 46, 99, 111, 109, 47, 103, 111, 111, 103, 108, 101, 46, 99, 114, 121, 112, 116, 111, 46, 116, 105, 110, 107, 46, 65, 101, 115, 71, 99, 109, 75, 101, 121, 18, 34, 26, 32, 163, 31, 161, 18, 18, 15, 15, 144, 149, 155, 252, 241, 242, 93, 63, 154, 144, 27, 171, 16, 117, 126, 253, 191, 167, 121, 172, 192, 34, 212, 145, 109, 24, 1, 16, 1, 24, 203, 189, 206, 191, 3, 32, 1}
+	keyVersion.Status = 1
+	keyVersion.CreationTime = 12345
+	expected := knox.Key{
+		ID:          "tink:aead:my_test_key",
+		ACL:         knox.ACL([]knox.Access{}),
+		VersionList: knox.KeyVersionList{keyVersion},
+		VersionHash: "VersionHash",
+		TinkKeyset:  "",
+	}
+	if err := addRegisteredKey(expected.ID, d.registerFilename()); err != nil {
+		t.Fatal("Failed to register key: " + err.Error())
+	}
+	params.setFunc(func(r *http.Request) {
+		switch r.URL.Path {
+		case "/v0/keys/":
+			setGoodResponse(params, []string{expected.ID})
+		case "/v0/keys/" + expected.ID + "/":
+			setGoodResponse(params, expected)
+		default:
+			t.Fatal("Unexpected path:" + r.URL.Path)
+		}
+	})
+	err := d.processKey(expected.ID)
+	if err != nil {
+		t.Fatalf("%s is not nil", err)
+	}
+
+	cachedTinkKey, err := d.cli.CacheGetKey(expected.ID)
+	if err != nil {
+		t.Fatalf("%s is not nil", err)
+	}
+	if cachedTinkKey.TinkKeyset != expectedTinkKeysetStr {
+		t.Fatalf("%s is not equal to %s", expected.TinkKeyset, expectedTinkKeysetStr)
 	}
 }
 
@@ -368,7 +494,7 @@ func addRegisteredKey(k, reg string) error {
 }
 
 func TestCreateGet(t *testing.T) {
-	dir, err := ioutil.TempDir("", "knox-test")
+	dir, err := os.MkdirTemp("", "knox-test")
 	if err != nil {
 		t.Fatal("Failed to create temp directory: " + err.Error())
 	}
@@ -398,7 +524,7 @@ func TestCreateGet(t *testing.T) {
 }
 
 func TestDuplicateAdd(t *testing.T) {
-	dir, err := ioutil.TempDir("", "knox-test")
+	dir, err := os.MkdirTemp("", "knox-test")
 	if err != nil {
 		t.Fatal("Failed to create temp directory: " + err.Error())
 	}
@@ -440,7 +566,7 @@ func TestDuplicateAdd(t *testing.T) {
 }
 
 func TestAddRemove(t *testing.T) {
-	dir, err := ioutil.TempDir("", "knox-test")
+	dir, err := os.MkdirTemp("", "knox-test")
 	if err != nil {
 		t.Fatal("Failed to create temp directory: " + err.Error())
 	}
@@ -479,7 +605,7 @@ func TestAddRemove(t *testing.T) {
 }
 
 func TestOverwrite(t *testing.T) {
-	dir, err := ioutil.TempDir("", "knox-test")
+	dir, err := os.MkdirTemp("", "knox-test")
 	if err != nil {
 		t.Fatal("Failed to create temp directory: " + err.Error())
 	}
@@ -520,14 +646,14 @@ func TestOverwrite(t *testing.T) {
 }
 
 func TestBackwardsCompat(t *testing.T) {
-	dir, err := ioutil.TempDir("", "knox-test")
+	dir, err := os.MkdirTemp("", "knox-test")
 	if err != nil {
 		t.Fatal("Failed to create temp directory: " + err.Error())
 	}
 	defer TearDownTest(dir)
 	fn := dir + "/TestBackwardsCompat"
 	k := NewKeysFile(fn)
-	err = ioutil.WriteFile(fn, []byte{}, defaultFilePermission)
+	err = os.WriteFile(fn, []byte{}, defaultFilePermission)
 	if err != nil {
 		t.Fatalf("%s is not nil", err)
 	}
@@ -573,14 +699,14 @@ func TestLockTimeout(t *testing.T) {
 		t.Fatal("flock is not installed in path")
 	}
 
-	tmp, err := ioutil.TempDir("", "test-lock-timeout")
+	tmp, err := os.MkdirTemp("", "test-lock-timeout")
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer os.RemoveAll(tmp)
 
 	lockFile := path.Join(tmp, "lock")
-	ioutil.WriteFile(lockFile, []byte{}, 0600)
+	os.WriteFile(lockFile, []byte{}, 0600)
 
 	// Lock file in sub-process to create locking conflict
 	locker, stdout, stderr := lockFileInSeparateProcess(t, lockFile, "300")
@@ -591,8 +717,8 @@ func TestLockTimeout(t *testing.T) {
 			syscall.Kill(-locker.Process.Pid, syscall.SIGKILL)
 
 			// Print stdout/stderr from locking process for debugging
-			allStdout, err := ioutil.ReadAll(stdout)
-			allStderr, err := ioutil.ReadAll(stderr)
+			allStdout, err := io.ReadAll(stdout)
+			allStderr, err := io.ReadAll(stderr)
 			t.Log(string(allStdout), err)
 			t.Log(string(allStderr), err)
 		}

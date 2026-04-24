@@ -5,15 +5,65 @@ import (
 	"crypto/x509"
 	"encoding/json"
 	"fmt"
-	"io/ioutil"
+	"io"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
     "net"
 
+	"github.com/gorilla/context"
 	"github.com/pinterest/knox"
     "golang.org/x/crypto/ssh"
 )
+
+type contextKey int
+
+const (
+	principalCtxKey contextKey = iota
+)
+
+type PrincipalContext interface {
+	SetCurrentPrincipal(principal knox.Principal)
+	GetCurrentPrincipal() knox.Principal
+}
+
+type principalContext struct {
+	principalCtxKey contextKey
+	request         *http.Request
+	once            sync.Once
+	invocationCount int
+}
+
+func NewPrincipalContext(request *http.Request) PrincipalContext {
+	return &principalContext{
+		principalCtxKey,
+		request,
+		sync.Once{},
+		0,
+	}
+}
+
+func (ctx *principalContext) GetCurrentPrincipal() knox.Principal {
+	if rv := context.Get(ctx.request, principalCtxKey); rv != nil {
+		return rv.(knox.Principal)
+	}
+	return nil
+}
+
+func (ctx *principalContext) SetCurrentPrincipal(principal knox.Principal) {
+	if ctx.invocationCount > 0 {
+		panic("SetPrincipal was called more than once during the lifetime of the HTTP request")
+	}
+	ctx.setPrincipalInner(ctx.request, principal)
+}
+
+func (ctx *principalContext) setPrincipalInner(httpRequest *http.Request, principal knox.Principal) {
+	ctx.once.Do(func() {
+		context.Set(httpRequest, ctx.principalCtxKey, principal)
+		ctx.invocationCount += 1
+	})
+}
 
 // Provider is used for authenticating requests via the authentication decorator.
 type Provider interface {
@@ -27,7 +77,7 @@ func verifyCertificate(r *http.Request, cas *x509.CertPool,
 	timeFunc func() time.Time) (*x509.Certificate, error) {
 	certs := r.TLS.PeerCertificates
 	if len(certs) == 0 {
-		return nil, fmt.Errorf("auth: No peer certs configured")
+		return nil, fmt.Errorf("auth: no peer certs configured")
 	}
 	opts := x509.VerifyOptions{
 		Roots:         cas,
@@ -42,10 +92,10 @@ func verifyCertificate(r *http.Request, cas *x509.CertPool,
 
 	chains, err := certs[0].Verify(opts)
 	if err != nil {
-		return nil, fmt.Errorf("auth: failed to verify client's certificate: " + err.Error())
+		return nil, fmt.Errorf("auth: failed to verify client's certificate: %w", err)
 	}
 	if len(chains) == 0 {
-		return nil, fmt.Errorf("auth: No cert chains could be verified")
+		return nil, fmt.Errorf("auth: no cert chains could be verified")
 	}
 	return certs[0], nil
 }
@@ -144,7 +194,7 @@ func (p *SpiffeProvider) Authenticate(token string, r *http.Request) (knox.Princ
 
 func spiffeToPrincipal(spiffeURIs []string) (knox.Principal, error) {
 	if len(spiffeURIs) == 0 {
-		return nil, fmt.Errorf("auth: no spiffe identity in certificate")
+		return nil, fmt.Errorf("auth: no SPIFFE identity in certificate")
 	}
 	if len(spiffeURIs) > 1 {
 		return nil, fmt.Errorf("auth: more than one service identity specified in certificate")
@@ -152,11 +202,11 @@ func spiffeToPrincipal(spiffeURIs []string) (knox.Principal, error) {
 
 	uri := spiffeURIs[0]
 	if !strings.HasPrefix(uri, "spiffe://") {
-		return nil, fmt.Errorf("auth: service identity was not a valid SPIFFE ID (bad prefix)")
+		return nil, fmt.Errorf("auth: service identity is not a valid SPIFFE ID (bad prefix)")
 	}
 	splits := strings.SplitN(uri[9:], "/", 2)
 	if len(splits) != 2 {
-		return nil, fmt.Errorf("auth: service identity was not a valid SPIFFE ID (bad format)")
+		return nil, fmt.Errorf("auth: service identity is not a valid SPIFFE ID (bad format)")
 	}
 
 	return NewService(splits[0], splits[1]), nil
@@ -249,12 +299,13 @@ func (p *GitHubProvider) getAPI(url, token string, v interface{}) error {
 	if err != nil {
 		return err
 	}
+	defer resp.Body.Close()
 	if resp.StatusCode != 200 {
-		return fmt.Errorf("API request returned status: %s", resp.Status)
+		return fmt.Errorf("api request returned status %s", resp.Status)
 	}
 	decoder := json.NewDecoder(resp.Body)
-	defer resp.Body.Close()
-	return decoder.Decode(v)
+	err = decoder.Decode(v)
+	return err
 }
 
 // GitHubLoginFormat specifies the json return format for /user field.
@@ -374,6 +425,15 @@ func (u user) GetID() string {
 	return u.ID
 }
 
+func (u user) Raw() []knox.RawPrincipal {
+	return []knox.RawPrincipal{
+		{
+			ID:   u.GetID(),
+			Type: u.Type(),
+		},
+	}
+}
+
 // Type returns the underlying type of a principal, for logging/debugging purposes.
 func (u user) Type() string {
 	return "user"
@@ -407,6 +467,15 @@ func (m machine) GetID() string {
 // Type returns the underlying type of a principal, for logging/debugging purposes.
 func (m machine) Type() string {
 	return "machine"
+}
+
+func (m machine) Raw() []knox.RawPrincipal {
+	return []knox.RawPrincipal{
+		{
+			ID:   m.GetID(),
+			Type: m.Type(),
+		},
+	}
 }
 
 // CanAccess determines if a Machine can access an object represented by the ACL
@@ -444,6 +513,15 @@ func (s service) Type() string {
 	return "service"
 }
 
+func (s service) Raw() []knox.RawPrincipal {
+	return []knox.RawPrincipal{
+		{
+			ID:   s.GetID(),
+			Type: s.Type(),
+		},
+	}
+}
+
 // CanAccess determines if a Service can access an object represented by the ACL
 // with a certain AccessType. It compares Service id and id prefix.
 func (s service) CanAccess(acl knox.ACL, t knox.AccessType) bool {
@@ -472,6 +550,7 @@ func (c *mockHTTPClient) Do(req *http.Request) (*http.Response, error) {
 	a := req.Header.Get("Authorization")
 	if a == "" || a == "Bearer notvalid" {
 		resp.StatusCode = 400
+		resp.Body = io.NopCloser(bytes.NewBuffer(nil))
 		resp.Status = "400 Unauthorized"
 
 		return resp, nil
@@ -479,16 +558,17 @@ func (c *mockHTTPClient) Do(req *http.Request) (*http.Response, error) {
 	switch req.URL.Path {
 	case "/user":
 		data := "{\"login\":\"testuser\"}"
-		resp.Body = ioutil.NopCloser(bytes.NewBufferString(data))
+		resp.Body = io.NopCloser(bytes.NewBufferString(data))
 		resp.StatusCode = 200
 		return resp, nil
 	case "/user/orgs":
 		data := "[{\"login\":\"testgroup\"}]"
-		resp.Body = ioutil.NopCloser(bytes.NewBufferString(data))
+		resp.Body = io.NopCloser(bytes.NewBufferString(data))
 		resp.StatusCode = 200
 		return resp, nil
 	default:
 		resp.StatusCode = 404
+		resp.Body = io.NopCloser(bytes.NewBuffer(nil))
 		resp.Status = "404 Not found"
 		return resp, nil
 	}

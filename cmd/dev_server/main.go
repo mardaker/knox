@@ -77,15 +77,20 @@ func main() {
 		server.Logger(accLogger),
 		server.AddHeader("Content-Type", "application/json"),
 		server.AddHeader("X-Content-Type-Options", "nosniff"),
-		server.Authentication([]auth.Provider{
-			auth.NewMTLSAuthProvider(certPool),
-			auth.NewGitHubProvider(authTimeout),
-			auth.NewSpiffeAuthProvider(certPool),
-			auth.NewSpiffeAuthFallbackProvider(certPool),
-		}),
+		server.Authentication(
+			[]auth.Provider{
+				auth.NewMTLSAuthProvider(certPool),
+				auth.NewGitHubProvider(authTimeout),
+				auth.NewSpiffeAuthProvider(certPool),
+				auth.NewSpiffeAuthFallbackProvider(certPool),
+			},
+			nil),
 	}
 
-	r := server.GetRouter(cryptor, db, decorators)
+	r, err := server.GetRouter(cryptor, db, decorators, make([]server.Route, 0))
+	if err != nil {
+		errLogger.Fatal(err)
+	}
 
 	http.Handle("/", r)
 

@@ -2,10 +2,10 @@ package client
 
 import (
 	"bytes"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io/ioutil"
 	"math/rand"
 	"os"
 	"os/exec"
@@ -48,12 +48,14 @@ var defaultDirPermission os.FileMode = 0777
 
 var daemonRefreshTime = 10 * time.Minute
 
-func runDaemon(cmd *Command, args []string) {
+const tinkPrefix = "tink:"
+
+func runDaemon(cmd *Command, args []string) *ErrorStatus {
 
 	if os.Getenv("KNOX_MACHINE_AUTH") == "" {
 		hostname, err := os.Hostname()
 		if err != nil {
-			fatalf("You're on a host with no name: %s", err.Error())
+			return &ErrorStatus{fmt.Errorf("you're on a host with no name: %w", err), false}
 		}
 		os.Setenv("KNOX_MACHINE_AUTH", hostname)
 	}
@@ -66,9 +68,10 @@ func runDaemon(cmd *Command, args []string) {
 	}
 	err := d.initialize()
 	if err != nil {
-		fatalf(err.Error())
+		return &ErrorStatus{err, false}
 	}
 	d.loop(daemonRefreshTime)
+	return nil
 }
 
 type daemon struct {
@@ -87,7 +90,7 @@ func (d *daemon) loop(refresh time.Duration) {
 
 	watcher, err := fsnotify.NewWatcher()
 	if err != nil {
-		fatalf("Unable to watch files: %s", err.Error())
+		fatalf("unable to watch files: %v", err)
 	}
 	watcher.Add(d.registerFilename())
 
@@ -97,7 +100,7 @@ func (d *daemon) loop(refresh time.Duration) {
 		err := d.update()
 		if err != nil {
 			d.updateErrCount++
-			logf("Failed to update keys: %s", err.Error())
+			logf("failed to update keys: %v", err)
 		} else {
 			d.successCount++
 		}
@@ -119,41 +122,61 @@ func (d *daemon) loop(refresh time.Duration) {
 	}
 }
 
+// chmodIfNeeded sets mode on path only if it differs from the current mode.
+// This avoids "operation not permitted" when running as non-root when permissions are already correct.
+func chmodIfNeeded(path string, want os.FileMode) error {
+	info, err := os.Stat(path)
+	if err != nil {
+		return err
+	}
+	if info.Mode().Perm() == want.Perm() {
+		return nil
+	}
+	return os.Chmod(path, want)
+}
+
+// ensureDirExists creates path as a directory with perm, or returns nil if it already exists.
+// When running as non-root (e.g. in Kubernetes), the directory may have been created by an
+// init container; if MkdirAll fails with permission denied, we still succeed when the path exists.
+func ensureDirExists(path string, perm os.FileMode) error {
+	err := os.MkdirAll(path, perm)
+	if err == nil {
+		return nil
+	}
+	info, statErr := os.Stat(path)
+	if statErr == nil && info.IsDir() {
+		return nil
+	}
+	return err
+}
+
 func (d *daemon) initialize() error {
-	err := os.MkdirAll(d.dir, defaultDirPermission)
-	if err != nil {
-		return fmt.Errorf("Failed to initialize /var/lib/knox (run 'sudo mkdir /var/lib/knox'?): %s", err.Error())
+	if err := ensureDirExists(d.dir, defaultDirPermission); err != nil {
+		return fmt.Errorf("failed to initialize /var/lib/knox (run 'sudo mkdir /var/lib/knox'?): %w", err)
 	}
 
-	// Need to chmod due to a umask set on masterless puppet machines
-	err = os.Chmod(d.dir, defaultDirPermission)
-	if err != nil {
-		return fmt.Errorf("Failed to open up directory permissions: %s", err.Error())
+	// Need to chmod due to a umask set on masterless puppet machines (skip if already correct for non-root)
+	if err := chmodIfNeeded(d.dir, defaultDirPermission); err != nil {
+		return fmt.Errorf("failed to open up directory permissions: %w", err)
 	}
-	err = os.MkdirAll(d.keyDir(), defaultDirPermission)
-	if err != nil {
-		return fmt.Errorf("Failed to make key folders: %s", err.Error())
+	if err := ensureDirExists(d.keyDir(), defaultDirPermission); err != nil {
+		return fmt.Errorf("failed to make key folders: %w", err)
 	}
 
-	// Need to chmod due to a umask set on masterless puppet machines
-	err = os.Chmod(d.keyDir(), defaultDirPermission)
-	if err != nil {
-		return fmt.Errorf("Failed to open up directory permissions: %s", err.Error())
+	if err := chmodIfNeeded(d.keyDir(), defaultDirPermission); err != nil {
+		return fmt.Errorf("failed to open up directory permissions: %w", err)
 	}
-	_, err = os.Stat(d.registerFilename())
+	_, err := os.Stat(d.registerFilename())
 	if os.IsNotExist(err) {
-		err := ioutil.WriteFile(d.registerFilename(), []byte{}, defaultFilePermission)
-		if err != nil {
-			return fmt.Errorf("Failed to initialize registered key file: %s", err.Error())
+		if err := os.WriteFile(d.registerFilename(), []byte{}, defaultFilePermission); err != nil {
+			return fmt.Errorf("failed to initialize registered key file: %w", err)
 		}
 	} else if err != nil {
 		return err
 	}
 
-	// Need to chmod due to a umask set on masterless puppet machines
-	err = os.Chmod(d.registerFilename(), defaultFilePermission)
-	if err != nil {
-		return fmt.Errorf("Failed to open up register file permissions: %s", err.Error())
+	if err := chmodIfNeeded(d.registerFilename(), defaultFilePermission); err != nil {
+		return fmt.Errorf("failed to open up register file permissions: %w", err)
 	}
 	d.registerKeyFile = NewKeysFile(d.registerFilename())
 	return nil
@@ -193,7 +216,11 @@ func (d *daemon) update() error {
 			key, err := d.cli.CacheGetKey(keyID)
 			if err != nil {
 				// Keep going in spite of failure
-				logf("error getting cache key: %s", err)
+				logf("error getting cache key: %v", err)
+				// Remove existing cached key with invalid format (saved with previous version clients)
+				if _, err = os.Stat(d.keyFilename(keyID)); err == nil {
+					d.deleteKey(keyID)
+				}
 			} else {
 				keyMap[keyID] = key.VersionHash
 			}
@@ -215,7 +242,7 @@ func (d *daemon) update() error {
 			if err != nil {
 				// Keep going in spite of failure
 				d.getKeyErrCount++
-				logf("error processing key: %s", err)
+				logf("error processing key: %v", err)
 			}
 		}
 	}
@@ -237,7 +264,7 @@ func (d daemon) deleteKey(keyID string) error {
 }
 
 func (d daemon) currentRegisteredKeys() ([]string, error) {
-	files, err := ioutil.ReadDir(d.keyDir())
+	files, err := os.ReadDir(d.keyDir())
 	if err != nil {
 		return nil, err
 	}
@@ -263,26 +290,45 @@ func (d daemon) keyFilename(id string) string {
 func (d daemon) processKey(keyID string) error {
 	key, err := d.cli.NetworkGetKey(keyID)
 	if err != nil {
-		if err.Error() == "User or machine not authorized" || err.Error() == "Key identifer does not exist" {
+		errMsg := err.Error()
+		// Check for authorization or key not found errors (using contains for more robust matching)
+		if strings.Contains(errMsg, "User or machine not authorized") || strings.Contains(errMsg, "Key identifier does not exist") {
 			// This removes keys that do not exist or the machine is unauthorized to access
 			d.registerKeyFile.Remove([]string{keyID})
 		}
-		return fmt.Errorf("Error getting key %s: %s", keyID, err.Error())
+		return fmt.Errorf("error getting key %s: %w", keyID, err)
 	}
+	// Do not cache any new keys if they have invalid content
+	if key.ID == "" || key.ACL == nil || key.VersionList == nil || key.VersionHash == "" {
+		return fmt.Errorf("invalid key content returned")
+	}
+
+	if strings.HasPrefix(keyID, tinkPrefix) {
+		keysetHandle, _, err := getTinkKeysetHandleFromKnoxVersionList(key.VersionList)
+		if err != nil {
+			return fmt.Errorf("error fetching keyset handle for this tink key %s: %w", keyID, err)
+		}
+		tinkKeyset, err := convertTinkKeysetHandleToBytes(keysetHandle)
+		if err != nil {
+			return fmt.Errorf("error converting tink keyset handle to bytes %s: %w", keyID, err)
+		}
+		key.TinkKeyset = base64.StdEncoding.EncodeToString(tinkKeyset)
+	}
+
 	b, err := json.Marshal(key)
 	if err != nil {
-		return fmt.Errorf("Error marshalling key %s: %s", keyID, err.Error())
+		return fmt.Errorf("error marshalling key %s: %w", keyID, err)
 	}
 	// Write to tmpfile, mv to normal location. Close + rm on failures
-	tmpFile, err := ioutil.TempFile(d.dir, fmt.Sprintf(".*.%s.tmp", keyID))
+	tmpFile, err := os.CreateTemp(d.dir, fmt.Sprintf(".*.%s.tmp", keyID))
 	if err != nil {
-		return fmt.Errorf("Error opening tmp file for key %s: %s", keyID, err.Error())
+		return fmt.Errorf("error opening tmp file for key %s: %w", keyID, err)
 	}
 	_, err = tmpFile.Write(b)
 	if err != nil {
 		tmpFile.Close()
 		os.Remove(tmpFile.Name())
-		return fmt.Errorf("Error writing key %s to file: %s", keyID, err.Error())
+		return fmt.Errorf("error writing key %s to file: %w", keyID, err)
 	}
 	// Done writing
 	tmpFile.Close()
@@ -290,12 +336,11 @@ func (d daemon) processKey(keyID string) error {
 	err = os.Rename(tmpFile.Name(), d.keyFilename(keyID))
 	if err != nil {
 		os.Remove(tmpFile.Name())
-		return fmt.Errorf("Error renaming key %s temporary file: %s", keyID, err.Error())
+		return fmt.Errorf("error renaming key %s temporary file: %w", keyID, err)
 	}
 
-	err = os.Chmod(d.keyFilename(keyID), defaultFilePermission)
-	if err != nil {
-		return fmt.Errorf("Failed to open up key file permissions: %s", err.Error())
+	if err := chmodIfNeeded(d.keyFilename(keyID), defaultFilePermission); err != nil {
+		return fmt.Errorf("failed to open up key file permissions: %w", err)
 	}
 	return nil
 }
@@ -354,7 +399,7 @@ func (k *KeysFile) Unlock() error {
 
 // Get will get the list of key ids. It expects Lock to have been called.
 func (k *KeysFile) Get() ([]string, error) {
-	b, err := ioutil.ReadFile(k.fn)
+	b, err := os.ReadFile(k.fn)
 	if err != nil {
 		return nil, err
 	}
@@ -391,7 +436,7 @@ func (k *KeysFile) Remove(ks []string) error {
 		buffer.WriteString(k)
 		buffer.WriteByte('\n')
 	}
-	return ioutil.WriteFile(k.fn, buffer.Bytes(), 0666)
+	return os.WriteFile(k.fn, buffer.Bytes(), 0666)
 }
 
 // Add will add the key IDs to the list. It expects Lock to have been called.
@@ -422,7 +467,7 @@ func (k *KeysFile) Add(ks []string) error {
 		buffer.WriteString(k)
 		buffer.WriteByte('\n')
 	}
-	return ioutil.WriteFile(k.fn, buffer.Bytes(), 0666)
+	return os.WriteFile(k.fn, buffer.Bytes(), 0666)
 }
 
 // Overwrite deletes all existing values in the key list and writes the input.
@@ -439,7 +484,7 @@ func (k *KeysFile) Overwrite(ks []string) error {
 		buffer.WriteString(k)
 		buffer.WriteByte('\n')
 	}
-	return ioutil.WriteFile(k.fn, buffer.Bytes(), 0666)
+	return os.WriteFile(k.fn, buffer.Bytes(), 0666)
 }
 
 func identifyLockHolders(filename string) (string, error) {
@@ -450,7 +495,7 @@ func identifyLockHolders(filename string) (string, error) {
 	cmd := exec.Command("lsof", filename)
 	out, err := cmd.CombinedOutput()
 	if err != nil {
-		return string(out), fmt.Errorf("error identifying lock holder: %s", err.Error())
+		return string(out), fmt.Errorf("error identifying lock holder: %w", err)
 	}
 
 	return string(out), nil

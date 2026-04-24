@@ -3,7 +3,7 @@ package client
 import (
 	"encoding/json"
 	"fmt"
-	"io/ioutil"
+	"os"
 
 	"github.com/pinterest/knox"
 )
@@ -13,7 +13,7 @@ func init() {
 }
 
 var cmdUpdateAccess = &Command{
-	UsageLine: "access (-acl <file> <key_identifier> | {-n|-r|-w|-a} {-M|-U|-G|-P} <key_identifier> <principal>)",
+	UsageLine: "access (-acl <file> <key_identifier> | {-n|-r|-w|-a} {-M|-U|-G|-P|-S|-N} <key_identifier> <principal>)",
 	Short:     "access modifies the acl of a key",
 	Long: `
 Access will add or change the acl on a key by adding a specific access control rule.
@@ -54,30 +54,30 @@ var updateAccessPrefix = cmdUpdateAccess.Flag.Bool("P", false, "")
 var updateAccessService = cmdUpdateAccess.Flag.Bool("S", false, "")
 var updateAccessServicePrefix = cmdUpdateAccess.Flag.Bool("N", false, "")
 
-func runUpdateAccess(cmd *Command, args []string) {
+func runUpdateAccess(cmd *Command, args []string) *ErrorStatus {
 	if *updateAccessACL != "" {
 		if len(args) != 1 {
-			fatalf("access takes one argument when used with --acl. See 'knox help access'")
+			return &ErrorStatus{fmt.Errorf("access takes one argument when used with --acl; see 'knox help access'"), false}
 		}
 		keyID := args[0]
-		b, err := ioutil.ReadFile(*updateAccessACL)
+		b, err := os.ReadFile(*updateAccessACL)
 		if err != nil {
-			fatalf("Could not read acl file %s", err.Error())
+			return &ErrorStatus{fmt.Errorf("could not read acl file: %w", err), false}
 		}
 		acl := []knox.Access{}
 		err = json.Unmarshal(b, &acl)
 		if err != nil {
-			fatalf("Could not decode access list properly %s", err.Error())
+			return &ErrorStatus{fmt.Errorf("could not decode access list properly: %w", err), false}
 		}
 		err = cli.PutAccess(keyID, acl...)
 		if err != nil {
-			fatalf("Failed to update access: %s", err.Error())
+			return &ErrorStatus{fmt.Errorf("failed to update access: %w", err), true}
 		}
 		fmt.Println("Successfully updated Access")
-		return
+		return nil
 	}
 	if len(args) != 2 {
-		fatalf("access takes exactly two arguments. See 'knox help access'")
+		return &ErrorStatus{fmt.Errorf("access takes exactly two arguments; see 'knox help access'"), false}
 	}
 	keyID := args[0]
 	principal := args[1]
@@ -93,7 +93,7 @@ func runUpdateAccess(cmd *Command, args []string) {
 	case *updateAccessAdmin:
 		access.AccessType = knox.Admin
 	default:
-		fatalf("access requires {-n,-r,-w,-a}. See 'knox help access'")
+		return &ErrorStatus{fmt.Errorf("access requires {-n,-r,-w,-a}; see 'knox help access'"), false}
 	}
 	switch {
 	case *updateAccessMachine:
@@ -109,11 +109,12 @@ func runUpdateAccess(cmd *Command, args []string) {
 	case *updateAccessServicePrefix:
 		access.Type = knox.ServicePrefix
 	default:
-		fatalf("access requires {-M|-U|-G|-P|-S|-N}. See 'knox help access'")
+		return &ErrorStatus{fmt.Errorf("access requires {-M|-U|-G|-P|-S|-N}; see 'knox help access'"), false}
 	}
 	err := cli.PutAccess(keyID, access)
 	if err != nil {
-		fatalf("Failed to update access: %s", err.Error())
+		return &ErrorStatus{fmt.Errorf("failed to update access: %w", err), true}
 	}
 	fmt.Println("Successfully updated Access")
+	return nil
 }

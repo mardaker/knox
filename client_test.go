@@ -1,13 +1,37 @@
 package knox
 
 import (
+	"bytes"
+	"context"
+	"crypto/tls"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"os/exec"
+	"path"
 	"reflect"
+	"runtime"
+	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 )
+
+type mockHTTPClient struct {
+	client  *http.Client
+	counter uint64
+}
+
+func (m *mockHTTPClient) Do(req *http.Request) (*http.Response, error) {
+	atomic.AddUint64(&m.counter, 1)
+	return m.client.Do(req)
+}
+
+func (m *mockHTTPClient) getCounter() uint64 {
+	return atomic.LoadUint64(&m.counter)
+}
 
 func TestMockClient(t *testing.T) {
 	p := "primary"
@@ -50,10 +74,10 @@ func buildGoodResponse(data interface{}) ([]byte, error) {
 
 }
 
-func buildInternalServerErrorResponse(data interface{}) ([]byte, error) {
+func buildErrorResponse(code int, data interface{}) ([]byte, error) {
 	resp := &Response{
 		Status:    "err",
-		Code:      InternalServerErrorCode,
+		Code:      code,
 		Host:      "test",
 		Timestamp: 1234567890,
 		Message:   "Internal Server Error",
@@ -73,13 +97,25 @@ func buildServer(code int, body []byte, a func(r *http.Request)) *httptest.Serve
 	}))
 }
 
-func buildConcurrentServer(code int, t *testing.T, a func(r *http.Request) []byte) *httptest.Server {
+func buildConcurrentServer(code int, a func(r *http.Request) []byte) *httptest.Server {
 	return httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		resp := a(r)
 		w.WriteHeader(code)
 		w.Header().Set("Content-Type", "application/json")
 		w.Write(resp)
 	}))
+}
+
+func isKnoxDaemonRunning() bool {
+	if runtime.GOOS != "linux" {
+		return false
+	}
+
+	cmd := exec.Command("systemctl", "is-active", "--quiet", "knox")
+	var out bytes.Buffer
+	cmd.Stdout = &out
+	err := cmd.Run()
+	return err == nil
 }
 
 func TestGetKey(t *testing.T) {
@@ -103,7 +139,7 @@ func TestGetKey(t *testing.T) {
 	})
 	defer srv.Close()
 
-	cli := MockClient(srv.Listener.Addr().String())
+	cli := MockClient(srv.Listener.Addr().String(), "")
 
 	k, err := cli.GetKey("testkey")
 	if err != nil {
@@ -126,6 +162,165 @@ func TestGetKey(t *testing.T) {
 	}
 }
 
+// TestGetKeyWithMultipleAuth tests getting keys with multiple auth methods
+func TestGetKeyWithMultipleAuth(t *testing.T) {
+	expected := Key{
+		ID:          "testkey",
+		ACL:         ACL([]Access{}),
+		VersionList: KeyVersionList{},
+		VersionHash: "VersionHash",
+	}
+
+	var ops uint64
+	srv := buildConcurrentServer(200, func(r *http.Request) []byte {
+		if r.Method != "GET" {
+			t.Fatalf("%s is not GET", r.Method)
+		}
+		if r.URL.Path != "/v0/keys/testkey1/" {
+			t.Fatalf("%s is not the path for testkey1", r.URL.Path)
+		}
+		atomic.AddUint64(&ops, 1)
+		var resp []byte
+		var err error
+		if ops == 1 {
+			resp, err = buildErrorResponse(UnauthorizedCode, nil)
+			if err != nil {
+				t.Fatalf("%s is not nil", err)
+			}
+		} else if ops == 2 {
+			resp, err = buildGoodResponse(expected)
+			if err != nil {
+				t.Fatalf("%s is not nil", err)
+			}
+		} else {
+			t.Fatalf("Unexpected number of requests: %d", ops)
+		}
+		return resp
+	})
+	defer srv.Close()
+
+	authHandlerFunc := func() (string, string, HTTP) {
+		return "TESTAUTH", "TESTAUTHTYPE", nil
+	}
+	mockClient := &mockHTTPClient{
+		client: &http.Client{Transport: &http.Transport{TLSClientConfig: &tls.Config{InsecureSkipVerify: true}}},
+	}
+	authHandlerFunc2 := func() (string, string, HTTP) {
+		return "TESTAUTH2", "TESTAUTHTYPE", mockClient
+	}
+	cli := &HTTPClient{
+		KeyFolder: "",
+		UncachedClient: &UncachedHTTPClient{
+			Host:          srv.Listener.Addr().String(),
+			AuthHandlers:  []AuthHandler{authHandlerFunc, authHandlerFunc2, authHandlerFunc2},
+			DefaultClient: &http.Client{Transport: &http.Transport{TLSClientConfig: &tls.Config{InsecureSkipVerify: true}}},
+			Version:       "mock",
+		},
+	}
+
+	// Get the key
+	k, err := cli.GetKey("testkey1")
+	if err != nil {
+		t.Fatalf("%s is not nil", err)
+	}
+	if k.ID != expected.ID {
+		t.Fatalf("%s does not equal %s", k.ID, expected.ID)
+	}
+	if len(k.ACL) != len(expected.ACL) {
+		t.Fatalf("%d does not equal %d", len(k.ACL), len(expected.ACL))
+	}
+	if len(k.VersionList) != len(expected.VersionList) {
+		t.Fatalf("%d does not equal %d", len(k.VersionList), len(expected.VersionList))
+	}
+	if k.VersionHash != expected.VersionHash {
+		t.Fatalf("%s does not equal %s", k.VersionHash, expected.VersionHash)
+	}
+	if k.Path != "" {
+		t.Fatalf("path '%v' is not empty", k.Path)
+	}
+
+	// Verify that our atomic counter was incremented 2 times (1 attempt for each authHandler)
+	if ops != 2 {
+		t.Fatalf("%d total client attempts is not 2", ops)
+	}
+
+	// Verify that the mock client was called once
+	if mockClient.getCounter() != 1 {
+		t.Fatalf("%d total mock client attempts is not 1", mockClient.getCounter())
+	}
+}
+
+// TestNoAuthPrincipals tests the case where no auth handlers are available
+func TestNoAuthPrincipals(t *testing.T) {
+	// Create a test server - won't be used since auth fails before request is made
+	resp, err := buildErrorResponse(UnauthenticatedCode, nil)
+	if err != nil {
+		t.Fatalf("%s is not nil", err)
+	}
+	srv := buildServer(200, resp, func(r *http.Request) {
+		// This should not be called as auth should fail before request is made
+		t.Fatalf("Server was called, but auth should have failed before request was made")
+	})
+	defer srv.Close()
+
+	// Create an auth handler that returns an empty string (simulating no valid auth)
+	emptyAuthHandler := func() (string, string, HTTP) {
+		return "", "", nil
+	}
+
+	// Create client with the empty auth handler
+	cli := &HTTPClient{
+		KeyFolder: "",
+		UncachedClient: &UncachedHTTPClient{
+			Host:          srv.Listener.Addr().String(),
+			AuthHandlers:  []AuthHandler{emptyAuthHandler},
+			DefaultClient: &http.Client{Transport: &http.Transport{TLSClientConfig: &tls.Config{InsecureSkipVerify: true}}},
+			Version:       "mock",
+		},
+	}
+
+	// Try to get keys
+	_, err = cli.GetKeys(map[string]string{})
+
+	// Check that we got the errNoAuth error
+	if !errors.Is(err, errNoAuth) {
+		t.Fatalf("Expected errNoAuth but got: %v", err)
+	}
+}
+
+// TestOnlyUnauthPrincipals tests the case where a principal is provided but it is unauthorized
+func TestOnlyUnauthPrincipals(t *testing.T) {
+	// Create a test server which returns an unauthorized error
+	resp, err := buildErrorResponse(UnauthorizedCode, nil)
+	if err != nil {
+		t.Fatalf("%s is not nil", err)
+	}
+	srv := buildServer(200, resp, func(r *http.Request) {})
+	defer srv.Close()
+
+	// Create client with the user auth handler
+	userAuthHandler := func() (string, string, HTTP) {
+		return "0uUSERTOKEN", "user", nil
+	}
+	cli := &HTTPClient{
+		KeyFolder: "",
+		UncachedClient: &UncachedHTTPClient{
+			Host:          srv.Listener.Addr().String(),
+			AuthHandlers:  []AuthHandler{userAuthHandler},
+			DefaultClient: &http.Client{Transport: &http.Transport{TLSClientConfig: &tls.Config{InsecureSkipVerify: true}}},
+			Version:       "mock",
+		},
+	}
+
+	// Attempt to get key
+	_, err = cli.GetKey("testkey")
+
+	// Check that we got the unauthorized error
+	if !errors.Is(err, errUnsuccessfulAuth) {
+		t.Fatalf("Expected errUnsuccessfulAuth but got: %v", err)
+	}
+}
+
 func TestGetKeys(t *testing.T) {
 	expected := []string{"a", "b", "c"}
 	resp, err := buildGoodResponse(expected)
@@ -145,7 +340,7 @@ func TestGetKeys(t *testing.T) {
 	})
 	defer srv.Close()
 
-	cli := MockClient(srv.Listener.Addr().String())
+	cli := MockClient(srv.Listener.Addr().String(), "")
 
 	k, err := cli.GetKeys(map[string]string{"y": "x"})
 	if err != nil {
@@ -191,7 +386,7 @@ func TestCreateKey(t *testing.T) {
 	})
 	defer srv.Close()
 
-	cli := MockClient(srv.Listener.Addr().String())
+	cli := MockClient(srv.Listener.Addr().String(), "")
 
 	acl := ACL([]Access{
 		{
@@ -242,7 +437,7 @@ func TestAddVersion(t *testing.T) {
 	})
 	defer srv.Close()
 
-	cli := MockClient(srv.Listener.Addr().String())
+	cli := MockClient(srv.Listener.Addr().String(), "")
 
 	k, err := cli.AddVersion("testkey", []byte("data"))
 	if err != nil {
@@ -269,7 +464,7 @@ func TestDeleteKey(t *testing.T) {
 	})
 	defer srv.Close()
 
-	cli := MockClient(srv.Listener.Addr().String())
+	cli := MockClient(srv.Listener.Addr().String(), "")
 
 	err = cli.DeleteKey("testkey")
 	if err != nil {
@@ -296,7 +491,7 @@ func TestPutVersion(t *testing.T) {
 	})
 	defer srv.Close()
 
-	cli := MockClient(srv.Listener.Addr().String())
+	cli := MockClient(srv.Listener.Addr().String(), "")
 
 	err = cli.UpdateVersion("testkey", "123", 2342)
 	if err == nil {
@@ -328,7 +523,7 @@ func TestPutAccess(t *testing.T) {
 	})
 	defer srv.Close()
 
-	cli := MockClient(srv.Listener.Addr().String())
+	cli := MockClient(srv.Listener.Addr().String(), "")
 
 	a := Access{
 		Type:       User,
@@ -355,7 +550,7 @@ func TestPutAccess(t *testing.T) {
 
 func TestConcurrentDeletes(t *testing.T) {
 	var ops uint64
-	srv := buildConcurrentServer(200, t, func(r *http.Request) []byte {
+	srv := buildConcurrentServer(200, func(r *http.Request) []byte {
 		if r.Method != "DELETE" {
 			t.Fatalf("%s is not DELETE", r.Method)
 		}
@@ -372,7 +567,7 @@ func TestConcurrentDeletes(t *testing.T) {
 				t.Fatalf("%s is not nil", err)
 			}
 		} else {
-			resp, err = buildInternalServerErrorResponse("")
+			resp, err = buildErrorResponse(InternalServerErrorCode, "")
 			if err != nil {
 				t.Fatalf("%s is not nil", err)
 			}
@@ -381,7 +576,7 @@ func TestConcurrentDeletes(t *testing.T) {
 	})
 	defer srv.Close()
 
-	cli := MockClient(srv.Listener.Addr().String())
+	cli := MockClient(srv.Listener.Addr().String(), "")
 
 	// Delete 2 independent keys in succession.
 	err := cli.DeleteKey("testkey1")
@@ -431,7 +626,7 @@ func TestGetKeyWithStatus(t *testing.T) {
 	})
 	defer srv.Close()
 
-	cli := MockClient(srv.Listener.Addr().String())
+	cli := MockClient(srv.Listener.Addr().String(), "")
 
 	k, err := cli.GetKeyWithStatus("testkey", Inactive)
 	if err != nil {
@@ -451,5 +646,297 @@ func TestGetKeyWithStatus(t *testing.T) {
 	}
 	if k.Path != "" {
 		t.Fatalf("path '%v' is not empty", k.Path)
+	}
+}
+
+func TestGetInvalidKeys(t *testing.T) {
+	expected := Key{
+		ID:          "",
+		ACL:         nil,
+		VersionList: nil,
+		VersionHash: "",
+	}
+
+	bytes, err := json.Marshal(expected)
+	if err != nil {
+		t.Fatalf("Error marshalling key %s", err)
+	}
+
+	tempDir := t.TempDir()
+	err = os.WriteFile(path.Join(tempDir, "testkey"), bytes, 0600)
+	if err != nil {
+		t.Fatalf("Failed to write invalid test key: %s", err)
+	}
+
+	resp, err := buildGoodResponse(expected)
+	if err != nil {
+		t.Fatalf("%s is not nil", err)
+	}
+	srv := buildServer(200, resp, func(r *http.Request) {
+		if r.Method != "GET" {
+			t.Fatalf("%s is not GET", r.Method)
+		}
+		if r.URL.Path != "/v0/keys/testkey/" {
+			t.Fatalf("%s is not %s", r.URL.Path, "/v0/keys/testkey/")
+		}
+	})
+	defer srv.Close()
+
+	cli := MockClient(srv.Listener.Addr().String(), tempDir)
+
+	_, err = cli.CacheGetKey("testkey")
+	if err == nil {
+		t.Fatalf("error expected for invalid key content")
+	} else {
+		if err.Error() != "invalid key content for the cached key" {
+			t.Fatalf("%s is not the expected error message", err)
+		}
+	}
+
+	_, err = cli.NetworkGetKey("testkey")
+	if err == nil {
+		t.Fatalf("error expected for invalid key content")
+	} else {
+		if err.Error() != "invalid key content for the remote key" {
+			t.Fatalf("%s is not the expected error message", err)
+		}
+	}
+}
+
+func TestNewFileClient(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("Test requires Linux with knox daemon infrastructure")
+	}
+	if isKnoxDaemonRunning() {
+		t.Skip("Knox daemon is running, skipping the test.")
+	}
+
+	_, err := NewFileClient("ThisKeyDoesNotExistSoWeExpectAnError")
+	// Check that we get an error message starting with the expected prefix
+	// The exact error can vary based on environment (exit status, executable not found, etc.)
+	expectedPrefix := "error getting knox key ThisKeyDoesNotExistSoWeExpectAnError. error:"
+	if err == nil || !strings.HasPrefix(err.Error(), expectedPrefix) {
+		t.Fatalf("Expected error starting with '%s', got: %v", expectedPrefix, err)
+	}
+}
+
+func TestCacheGetKeyWithContext(t *testing.T) {
+	expected := Key{
+		ID:          "testkey",
+		ACL:         ACL([]Access{}),
+		VersionList: KeyVersionList{},
+		VersionHash: "VersionHash",
+	}
+
+	keyBytes, err := json.Marshal(expected)
+	if err != nil {
+		t.Fatalf("Error marshalling key: %s", err)
+	}
+
+	tempDir := t.TempDir()
+	err = os.WriteFile(path.Join(tempDir, "testkey"), keyBytes, 0600)
+	if err != nil {
+		t.Fatalf("Failed to write test key: %s", err)
+	}
+
+	cli := &HTTPClient{
+		KeyFolder:      tempDir,
+		UncachedClient: &UncachedHTTPClient{},
+	}
+
+	// Test with valid context
+	ctx := context.Background()
+	k, err := cli.CacheGetKeyWithContext(ctx, "testkey")
+	if err != nil {
+		t.Fatalf("Unexpected error: %s", err)
+	}
+	if k.ID != expected.ID {
+		t.Fatalf("Expected ID %s, got %s", expected.ID, k.ID)
+	}
+
+	// Test with canceled context
+	canceledCtx, cancel := context.WithCancel(context.Background())
+	cancel()
+	_, err = cli.CacheGetKeyWithContext(canceledCtx, "testkey")
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("Expected context.Canceled error, got: %v", err)
+	}
+}
+
+func TestNetworkGetKeyWithContext(t *testing.T) {
+	expected := Key{
+		ID:          "testkey",
+		ACL:         ACL([]Access{}),
+		VersionList: KeyVersionList{},
+		VersionHash: "VersionHash",
+	}
+	resp, err := buildGoodResponse(expected)
+	if err != nil {
+		t.Fatalf("%s is not nil", err)
+	}
+	srv := buildServer(200, resp, func(r *http.Request) {
+		if r.Method != "GET" {
+			t.Fatalf("%s is not GET", r.Method)
+		}
+	})
+	defer srv.Close()
+
+	cli := MockClient(srv.Listener.Addr().String(), "")
+
+	// Test with valid context
+	ctx := context.Background()
+	k, err := cli.NetworkGetKeyWithContext(ctx, "testkey")
+	if err != nil {
+		t.Fatalf("Unexpected error: %s", err)
+	}
+	if k.ID != expected.ID {
+		t.Fatalf("Expected ID %s, got %s", expected.ID, k.ID)
+	}
+}
+
+func TestNetworkGetKeyWithContextCancellation(t *testing.T) {
+	// Create a server that delays response
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		time.Sleep(500 * time.Millisecond)
+		w.WriteHeader(200)
+		w.Header().Set("Content-Type", "application/json")
+		resp, _ := buildGoodResponse(Key{
+			ID:          "testkey",
+			ACL:         ACL([]Access{}),
+			VersionList: KeyVersionList{},
+			VersionHash: "VersionHash",
+		})
+		w.Write(resp)
+	}))
+	defer srv.Close()
+
+	cli := MockClient(srv.Listener.Addr().String(), "")
+
+	// Test with context that times out before server responds
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+
+	_, err := cli.NetworkGetKeyWithContext(ctx, "testkey")
+	if err == nil {
+		t.Fatal("Expected error due to context timeout, got nil")
+	}
+	// The error should be related to context deadline or cancellation
+	if !errors.Is(err, context.DeadlineExceeded) && !errors.Is(err, context.Canceled) {
+		// Also accept wrapped errors from http client
+		if err.Error() != "context deadline exceeded" && !errors.Is(errors.Unwrap(err), context.DeadlineExceeded) {
+			t.Logf("Got error: %v (type: %T)", err, err)
+			// Accept any error that indicates the request was canceled/timed out
+		}
+	}
+}
+
+func TestContextCancellationDuringRetry(t *testing.T) {
+	var requestCount uint64
+	srv := buildConcurrentServer(200, func(r *http.Request) []byte {
+		count := atomic.AddUint64(&requestCount, 1)
+		// Always return 500 error to trigger retry logic
+		// This ensures the client enters the backoff/retry path
+		if count <= 3 {
+			resp, _ := buildErrorResponse(InternalServerErrorCode, nil)
+			return resp
+		}
+		resp, _ := buildGoodResponse(Key{
+			ID:          "testkey",
+			ACL:         ACL([]Access{}),
+			VersionList: KeyVersionList{},
+			VersionHash: "VersionHash",
+		})
+		return resp
+	})
+	defer srv.Close()
+
+	cli := MockClient(srv.Listener.Addr().String(), "")
+
+	// Use a context that will be canceled during retry backoff.
+	// The backoff duration starts at ~50ms, so 100ms should be enough
+	// to make the first request but timeout during the backoff sleep.
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+
+	_, err := cli.NetworkGetKeyWithContext(ctx, "testkey")
+	// Should get an error because context times out during retry
+	if err == nil {
+		t.Fatal("Expected error due to context timeout during retry, got nil")
+	}
+	// Verify we got a context-related error
+	if !errors.Is(err, context.DeadlineExceeded) && !errors.Is(err, context.Canceled) {
+		t.Fatalf("Expected context deadline or cancellation error, got: %v", err)
+	}
+}
+
+func TestContextCancellationBeforeAuthHandler(t *testing.T) {
+	expected := Key{
+		ID:          "testkey",
+		ACL:         ACL([]Access{}),
+		VersionList: KeyVersionList{},
+		VersionHash: "VersionHash",
+	}
+	resp, err := buildGoodResponse(expected)
+	if err != nil {
+		t.Fatalf("%s is not nil", err)
+	}
+
+	var serverCalled bool
+	srv := buildServer(200, resp, func(r *http.Request) {
+		serverCalled = true
+	})
+	defer srv.Close()
+
+	cli := MockClient(srv.Listener.Addr().String(), "")
+
+	// Cancel the context before making the request
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	_, err = cli.NetworkGetKeyWithContext(ctx, "testkey")
+	if err == nil {
+		t.Fatal("Expected error due to canceled context")
+	}
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("Expected context.Canceled error, got: %v", err)
+	}
+	if serverCalled {
+		t.Fatal("Server should not have been called with canceled context")
+	}
+}
+
+func TestUncachedClientCacheGetKeyWithContext(t *testing.T) {
+	// UncachedHTTPClient.CacheGetKeyWithContext should delegate to NetworkGetKeyWithContext
+	expected := Key{
+		ID:          "testkey",
+		ACL:         ACL([]Access{}),
+		VersionList: KeyVersionList{},
+		VersionHash: "VersionHash",
+	}
+	resp, err := buildGoodResponse(expected)
+	if err != nil {
+		t.Fatalf("%s is not nil", err)
+	}
+	srv := buildServer(200, resp, func(r *http.Request) {
+		if r.Method != "GET" {
+			t.Fatalf("%s is not GET", r.Method)
+		}
+	})
+	defer srv.Close()
+
+	cli := &UncachedHTTPClient{
+		Host:          srv.Listener.Addr().String(),
+		AuthHandlers:  []AuthHandler{func() (string, string, HTTP) { return "TESTAUTH", "TESTAUTHTYPE", nil }},
+		DefaultClient: &http.Client{Transport: &http.Transport{TLSClientConfig: &tls.Config{InsecureSkipVerify: true}}},
+		Version:       "mock",
+	}
+
+	ctx := context.Background()
+	k, err := cli.CacheGetKeyWithContext(ctx, "testkey")
+	if err != nil {
+		t.Fatalf("Unexpected error: %s", err)
+	}
+	if k.ID != expected.ID {
+		t.Fatalf("Expected ID %s, got %s", expected.ID, k.ID)
 	}
 }

@@ -2,27 +2,30 @@ package server
 
 import (
 	"encoding/json"
+	"fmt"
 	"math/rand"
 	"net/http"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/gorilla/mux"
 
 	"github.com/pinterest/knox"
 	"github.com/pinterest/knox/log"
+	"github.com/pinterest/knox/server/auth"
 	"github.com/pinterest/knox/server/keydb"
 )
 
-// httpError is the error type with knox err subcode and message for logging purposes
-type httpError struct {
+// HTTPError is the error type with knox err subcode and message for logging purposes
+type HTTPError struct {
 	Subcode int
 	Message string
 }
 
 // errF is a convience method to make an httpError.
-func errF(c int, m string) *httpError {
-	return &httpError{c, m}
+func errF(c int, m string) *HTTPError {
+	return &HTTPError{c, m}
 }
 
 // httpErrResp contain the http codes and messages to be returned back to clients.
@@ -35,9 +38,9 @@ type httpErrResp struct {
 var HTTPErrMap = map[int]*httpErrResp{
 	knox.NoKeyIDCode:                   {http.StatusBadRequest, "Missing Key ID"},
 	knox.InternalServerErrorCode:       {http.StatusInternalServerError, "Internal Server Error"},
-	knox.KeyIdentifierExistsCode:       {http.StatusBadRequest, "Key identifer exists"},
+	knox.KeyIdentifierExistsCode:       {http.StatusBadRequest, "Key identifier exists"},
 	knox.KeyVersionDoesNotExistCode:    {http.StatusNotFound, "Key version does not exist"},
-	knox.KeyIdentifierDoesNotExistCode: {http.StatusNotFound, "Key identifer does not exist"},
+	knox.KeyIdentifierDoesNotExistCode: {http.StatusNotFound, "Key identifier does not exist"},
 	knox.UnauthenticatedCode:           {http.StatusUnauthorized, "User or machine is not authenticated"},
 	knox.UnauthorizedCode:              {http.StatusForbidden, "User or machine not authorized"},
 	knox.NotYetImplementedCode:         {http.StatusNotImplemented, "Not yet implemented"},
@@ -54,11 +57,41 @@ func combine(f, g func(http.HandlerFunc) http.HandlerFunc) func(http.HandlerFunc
 	}
 }
 
-// GetRouter creates the mux router that serves knox routes.
-// All routes are declared in this file. Each handler itself takes in the db and
-// auth provider interfaces and returns a handler that the is processed through
-// the API Middleware.
-func GetRouter(cryptor keydb.Cryptor, db keydb.DB, decorators [](func(http.HandlerFunc) http.HandlerFunc)) *mux.Router {
+// GetRouterFromKeyManager creates the mux router that serves knox routes from a key manager
+func GetRouterFromKeyManager(
+	cryptor keydb.Cryptor,
+	keyManager KeyManager,
+	decorators [](func(http.HandlerFunc) http.HandlerFunc),
+	additionalRoutes []Route) (*mux.Router, error) {
+	existingRouteIds := map[string]Route{}
+	existingRouteMethodAndPaths := map[string]map[string]Route{}
+	allRoutes := append(routes[:], additionalRoutes[:]...)
+
+	for _, route := range allRoutes {
+		if _, routeExists := existingRouteIds[route.Id]; routeExists {
+			return nil, fmt.Errorf(
+				"there are ID conflicts for the route with ID: '%v'",
+				route.Id,
+			)
+		}
+		childMap, methodExists := existingRouteMethodAndPaths[route.Method]
+		if !methodExists {
+			childMap := map[string]Route{
+				route.Path: route,
+			}
+			existingRouteMethodAndPaths[route.Method] = childMap
+		} else {
+			if conflictingRoute, pathExists := childMap[route.Path]; pathExists {
+				return nil, fmt.Errorf(
+					"there are Method/Path conflicts for the following Route IDs: ('%v' and '%v')",
+					conflictingRoute.Id, route.Id,
+				)
+			}
+		}
+
+		existingRouteMethodAndPaths[route.Method][route.Path] = route
+		existingRouteIds[route.Id] = route
+	}
 
 	r := mux.NewRouter()
 
@@ -68,46 +101,82 @@ func GetRouter(cryptor keydb.Cryptor, db keydb.DB, decorators [](func(http.Handl
 		decorator = combine(decorators[j], decorator)
 	}
 
+	r.NotFoundHandler = setupRoute("404", keyManager)(decorator(WriteErr(errF(knox.NotFoundCode, ""))))
+
+	for _, route := range allRoutes {
+		addRoute(r, route, decorator, keyManager)
+	}
+	return r, nil
+}
+
+// GetRouter creates the mux router that serves knox routes.
+// All routes are declared in this file. Each handler itself takes in the db and
+// auth provider interfaces and returns a handler that the is processed through
+// the API Middleware.
+func GetRouter(
+	cryptor keydb.Cryptor,
+	db keydb.DB,
+	decorators [](func(http.HandlerFunc) http.HandlerFunc),
+	additionalRoutes []Route) (*mux.Router, error) {
 	m := NewKeyManager(cryptor, db)
 
-	r.NotFoundHandler = setupRoute("404", m)(decorator(writeErr(errF(knox.NotFoundCode, ""))))
-	for _, route := range routes {
-		handler := setupRoute(route.id, m)(parseParams(route.parameters)(decorator(route.ServeHTTP)))
-		r.Handle(route.path, handler).Methods(route.method)
-	}
-	return r
+	return GetRouterFromKeyManager(cryptor, m, decorators, additionalRoutes)
 }
 
-type parameter interface {
-	name() string
-	get(r *http.Request) (string, bool)
+func addRoute(
+	router *mux.Router,
+	route Route,
+	routeDecorator func(f http.HandlerFunc) http.HandlerFunc,
+	keyManager KeyManager) {
+	handler := setupRoute(route.Id, keyManager)(parseParams(route.Parameters)(routeDecorator(route.ServeHTTP)))
+	router.Handle(route.Path, handler).Methods(route.Method)
 }
 
-type urlParameter string
+// Parameter is an interface through which route-specific Knox API Parameters
+// can be specified
+type Parameter interface {
+	Name() string
+	Get(r *http.Request) (string, bool)
+}
 
-// Get returns the url
-func (p urlParameter) get(r *http.Request) (string, bool) {
+// UrlParameter is an implementation of the Parameter interface that extracts
+// parameter values from the URL as referenced in section 3.3 of RFC2396.
+type UrlParameter string
+
+// Get returns the value of the URL parameter
+func (p UrlParameter) Get(r *http.Request) (string, bool) {
 	s, ok := mux.Vars(r)[string(p)]
 	return s, ok
 }
 
-func (p urlParameter) name() string {
+// Name defines the URL-embedded key that this parameter maps to
+func (p UrlParameter) Name() string {
 	return string(p)
 }
 
-type rawQueryParameter string
+// RawQueryParameter is an implementation of the Parameter interface that
+// extracts the complete query string from the request URL
+// as referenced in section 3.4 of RFC2396.
+type RawQueryParameter string
 
-func (p rawQueryParameter) get(r *http.Request) (string, bool) {
+// Get returns the value of the entire query string
+func (p RawQueryParameter) Get(r *http.Request) (string, bool) {
 	return r.URL.RawQuery, true
 }
 
-func (p rawQueryParameter) name() string {
+// Name represents the key-name that will be set for the raw query string
+// in the `parameters` map of the route handler function.
+func (p RawQueryParameter) Name() string {
 	return string(p)
 }
 
-type queryParameter string
+// QueryParameter is an implementation of the Parameter interface that extracts
+// specific parameter values from the query string of the request URL
+// as referenced in section 3.4 of RFC2396.
+type QueryParameter string
 
-func (p queryParameter) get(r *http.Request) (string, bool) {
+// Get returns the value of the query string parameter
+func (p QueryParameter) Get(r *http.Request) (string, bool) {
 	val, ok := r.URL.Query()[string(p)]
 	if !ok {
 		return "", false
@@ -115,13 +184,18 @@ func (p queryParameter) get(r *http.Request) (string, bool) {
 	return val[0], true
 }
 
-func (p queryParameter) name() string {
+// Name defines the URL-embedded key that this parameter maps to
+func (p QueryParameter) Name() string {
 	return string(p)
 }
 
-type postParameter string
+// PostParameter is an implementation of the Parameter interface that
+// extracts values embedded in the web form transmitted in the
+// request body
+type PostParameter string
 
-func (p postParameter) get(r *http.Request) (string, bool) {
+// Get returns the value of the appropriate parameter from the request body
+func (p PostParameter) Get(r *http.Request) (string, bool) {
 	err := r.ParseForm()
 	if err != nil {
 		return "", false
@@ -133,24 +207,43 @@ func (p postParameter) get(r *http.Request) (string, bool) {
 	return k[0], ok
 }
 
-func (p postParameter) name() string {
+// Name represents the key corresponding to this parameter in the request form
+func (p PostParameter) Name() string {
 	return string(p)
 }
 
-type route struct {
-	handler    func(db KeyManager, principal knox.Principal, parameters map[string]string) (interface{}, *httpError)
-	id         string
-	path       string
-	method     string
-	parameters []parameter
+// Route is a struct that defines a path and method-specific
+// HTTP route on the Knox server
+type Route struct {
+	// Handler represents the handler function that is responsible for serving
+	// this route
+	Handler func(db KeyManager, principal knox.Principal, parameters map[string]string) (interface{}, *HTTPError)
+
+	// Id represents A unique string identifier that represents this specific
+	// route
+	Id string
+
+	// Path represents the relative HTTP path (or prefix) that must be specified
+	//  in order to invoke this route
+	Path string
+
+	// Method represents the HTTP method that must be specified in order to
+	// invoke this route
+	Method string
+
+	// Parameters is an array that represents the route-specific parameters
+	// that will be passed to the handler function
+	Parameters []Parameter
 }
 
-func writeErr(apiErr *httpError) http.HandlerFunc {
+// WriteErr returns a function that can encode error information and set an
+// HTTP error response code in the specified HTTP response writer
+func WriteErr(apiErr *HTTPError) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		resp := new(knox.Response)
 		hostname, err := os.Hostname()
 		if err != nil {
-			panic("Hostname is required:" + err.Error())
+			panic(fmt.Sprintf("hostname is required: %v", err))
 		}
 		resp.Host = hostname
 		resp.Timestamp = time.Now().UnixNano()
@@ -163,40 +256,42 @@ func writeErr(apiErr *httpError) http.HandlerFunc {
 
 		if err := json.NewEncoder(w).Encode(resp); err != nil {
 			// It is unclear what to do here since the server failed to write the response.
-			log.Println(err.Error())
+			log.Println(err)
 		}
 	}
 }
 
-func writeData(w http.ResponseWriter, data interface{}) {
+// WriteData returns a function that can write arbitrary data to the specified
+// HTTP response writer
+func WriteData(w http.ResponseWriter, data interface{}) {
 	r := new(knox.Response)
 	r.Message = ""
 	r.Code = knox.OKCode
 	r.Status = "ok"
 	hostname, err := os.Hostname()
 	if err != nil {
-		panic("Hostname is required:" + err.Error())
+		panic(fmt.Sprintf("hostname is required: %v", err))
 	}
 	r.Host = hostname
 	r.Timestamp = time.Now().UnixNano()
 	r.Data = data
 	if err := json.NewEncoder(w).Encode(r); err != nil {
 		// It is unclear what to do here since the server failed to write the response.
-		log.Println(err.Error())
+		log.Println(err)
 	}
 }
 
 // ServeHTTP runs API middleware and calls the underlying handler function.
-func (r route) ServeHTTP(w http.ResponseWriter, req *http.Request) {
+func (r Route) ServeHTTP(w http.ResponseWriter, req *http.Request) {
 	db := getDB(req)
 	principal := GetPrincipal(req)
 	ps := GetParams(req)
-	data, err := r.handler(db, principal, ps)
+	data, err := r.Handler(db, principal, ps)
 
 	if err != nil {
-		writeErr(err)(w, req)
+		WriteErr(err)(w, req)
 	} else {
-		writeData(w, data)
+		WriteData(w, data)
 	}
 }
 
@@ -209,6 +304,13 @@ func AddDefaultAccess(a *knox.Access) {
 	defaultAccess = append(defaultAccess, *a)
 }
 
+var accessCallback func(knox.AccessCallbackInput) (bool, error)
+
+// SetAccessCallback adds a callback.
+func SetAccessCallback(callback func(knox.AccessCallbackInput) (bool, error)) {
+	accessCallback = callback
+}
+
 // Extra validators to apply on principals submitted to Knox.
 var extraPrincipalValidators []knox.PrincipalValidator
 
@@ -217,6 +319,85 @@ var extraPrincipalValidators []knox.PrincipalValidator
 // logic for e.g. what kind of machine or service prefixes are acceptable.
 func AddPrincipalValidator(validator knox.PrincipalValidator) {
 	extraPrincipalValidators = append(extraPrincipalValidators, validator)
+}
+
+// ServiceKeyCreationAuthorizer decides whether a non-user principal (e.g. a
+// SPIFFE service) is allowed to create a given key. Implementations hold their
+// own state (allowlists, rate limiters, project metadata, etc.) on their own
+// struct, so Knox itself does not own mutable package-level state.
+//
+// Authorize returns the owner Access that should be added as an Admin on the
+// newly created key to preserve the invariant that every key has a human
+// admin. If ok is false the key creation is rejected.
+type ServiceKeyCreationAuthorizer interface {
+	Authorize(principal knox.Principal, keyID string) (owner knox.Access, ok bool)
+}
+
+// serviceKeyCreationAuthorizer is the single pluggable hook for non-user key
+// creation. When nil (the default), only users may create keys.
+var serviceKeyCreationAuthorizer ServiceKeyCreationAuthorizer
+
+// SetServiceKeyCreationAuthorizer installs the authorizer invoked when a
+// non-user principal attempts to create a key. Pass nil to disable non-user
+// creation (the default).
+func SetServiceKeyCreationAuthorizer(a ServiceKeyCreationAuthorizer) {
+	serviceKeyCreationAuthorizer = a
+}
+
+// ServiceKeyCreationPolicy is a single entry in the reference
+// PrefixServiceKeyCreationAuthorizer implementation. It matches a service
+// principal by SPIFFE ID prefix and a key by key-ID prefix, and names the
+// human Owner that becomes an Admin on keys created under the policy.
+//
+// Metadata is free-form key/value data that callers may use for their own
+// bookkeeping (e.g. project name, rate-limit bucket). It is not interpreted
+// by Knox.
+type ServiceKeyCreationPolicy struct {
+	SpiffePrefix string
+	KeyPrefix    string
+	Owner        knox.Access
+	Metadata     map[string]string
+}
+
+// PrefixServiceKeyCreationAuthorizer is a reference ServiceKeyCreationAuthorizer
+// that matches services by SPIFFE prefix and keys by key-ID prefix. Consumers
+// who need richer behavior (rate limiting, dynamic config, etc.) should
+// implement ServiceKeyCreationAuthorizer themselves.
+type PrefixServiceKeyCreationAuthorizer struct {
+	policies []ServiceKeyCreationPolicy
+}
+
+// AddPolicy registers a policy. Returns an error if:
+//   - Owner is not specified (keys without a human admin would break Knox's
+//     ownership invariant), or
+//   - SpiffePrefix is not a well-formed SPIFFE prefix as validated by
+//     knox.ServicePrefix.IsValidPrincipal (must be a spiffe:// URL ending in
+//     "/" so prefix matching respects path-component boundaries).
+func (a *PrefixServiceKeyCreationAuthorizer) AddPolicy(p ServiceKeyCreationPolicy) error {
+	if p.Owner.ID == "" {
+		return fmt.Errorf("service key creation policy must specify an Owner with a non-empty ID")
+	}
+	if err := knox.PrincipalType(knox.ServicePrefix).IsValidPrincipal(p.SpiffePrefix, nil); err != nil {
+		return fmt.Errorf("invalid SpiffePrefix %q: %w", p.SpiffePrefix, err)
+	}
+	a.policies = append(a.policies, p)
+	return nil
+}
+
+// Authorize implements ServiceKeyCreationAuthorizer.
+func (a *PrefixServiceKeyCreationAuthorizer) Authorize(principal knox.Principal, keyID string) (knox.Access, bool) {
+	if !auth.IsService(principal) {
+		return knox.Access{}, false
+	}
+	id := principal.GetID()
+	for _, p := range a.policies {
+		if strings.HasPrefix(id, p.SpiffePrefix) && strings.HasPrefix(keyID, p.KeyPrefix) {
+			owner := p.Owner
+			owner.AccessType = knox.Admin
+			return owner, true
+		}
+	}
+	return knox.Access{}, false
 }
 
 // newKeyVersion creates a new KeyVersion with correctly set defaults.
@@ -230,14 +411,29 @@ func newKeyVersion(d []byte, s knox.VersionStatus) knox.KeyVersion {
 	return version
 }
 
-// NewKey creates a new Key with correctly set defaults.
-func newKey(id string, acl knox.ACL, d []byte, u knox.Principal) knox.Key {
+// newKey creates a new Key with correctly set defaults.
+//
+// The creator is always added as an Admin. Any extraAdmins (e.g. a human
+// owner for service-created keys) are also added as Admins so that the
+// invariant "every key has a human admin" is preserved in a single place.
+func newKey(id string, acl knox.ACL, d []byte, u knox.Principal, extraAdmins ...knox.Access) knox.Key {
 	key := knox.Key{}
 	key.ID = id
 
-	creatorAccess := knox.Access{ID: u.GetID(), AccessType: knox.Admin, Type: knox.User}
+	creatorType := knox.PrincipalType(knox.User)
+	if auth.IsService(u) {
+		creatorType = knox.Service
+	}
+	creatorAccess := knox.Access{ID: u.GetID(), AccessType: knox.Admin, Type: creatorType}
 	key.ACL = acl.Add(creatorAccess)
 	for _, a := range defaultAccess {
+		key.ACL = key.ACL.Add(a)
+	}
+	for _, a := range extraAdmins {
+		if a.ID == "" {
+			continue
+		}
+		a.AccessType = knox.Admin
 		key.ACL = key.ACL.Add(a)
 	}
 

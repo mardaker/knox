@@ -2,16 +2,25 @@ package client
 
 import (
 	"fmt"
-	"io/ioutil"
-	"os"
+
+	"github.com/pinterest/knox"
 )
 
+func init() {
+	cmdAdd.Run = runAdd // break init cycle
+}
+
 var cmdAdd = &Command{
-	Run:       runAdd,
-	UsageLine: "add <key_identifier>",
+	UsageLine: "add [--key-template template_name] <key_identifier>",
 	Short:     "adds a new key version to knox",
 	Long: `
-add adds a new key version to an existing key in knox. Key data should be sent to stdin.
+Add will add a new key version to an existing key in knox. Key data of new version should be sent to stdin unless a key-template is specified.
+
+First way: key data of new version is sent to stdin.
+Please run "knox add <key_identifier>". 
+
+Second way: the key-template option can be used to specify a template to generate the new key version, instead of stdin. For available key templates, run "knox key-templates".
+Please run "knox add --key-template <template_name> <key_identifier>".
 
 This key version will be set to active upon creation. The version id will be sent to stdout on creation.
 
@@ -22,20 +31,41 @@ For more about knox, see https://github.com/pinterest/knox.
 See also: knox create, knox promote
 	`,
 }
+var addTinkKeyset = cmdAdd.Flag.String("key-template", "", "name of a knox-supported Tink key template")
 
-func runAdd(cmd *Command, args []string) {
+func runAdd(cmd *Command, args []string) *ErrorStatus {
 	if len(args) != 1 {
-		fatalf("add takes only one argument. See 'knox help add'")
+		return &ErrorStatus{fmt.Errorf("add takes only one argument; see 'knox help add'"), false}
 	}
-	fmt.Println("Reading from stdin...")
 	keyID := args[0]
-	data, err := ioutil.ReadAll(os.Stdin)
+	var data []byte
+	var err error
+	if *addTinkKeyset != "" {
+		data, err = getDataWithTemplate(*addTinkKeyset, keyID)
+	} else {
+		data, err = readDataFromStdin()
+	}
 	if err != nil {
-		fatalf("Problem reading key data: %s", err.Error())
+		return &ErrorStatus{err, false}
 	}
 	versionID, err := cli.AddVersion(keyID, data)
 	if err != nil {
-		fatalf("Error adding version: %s", err.Error())
+		return &ErrorStatus{fmt.Errorf("error adding version: %w", err), true}
 	}
 	fmt.Printf("Added key version %d\n", versionID)
+	return nil
+}
+
+// getDataWithTemplate returns the data for a new version of a knox identifier that stores Tink keyset.
+func getDataWithTemplate(templateName string, keyID string) ([]byte, error) {
+	err := obeyNamingRule(templateName, keyID)
+	if err != nil {
+		return nil, err
+	}
+	// get all versions (primary, active, inactive) of this knox identifier
+	allVersions, err := cli.NetworkGetKeyWithStatus(keyID, knox.Inactive)
+	if err != nil {
+		return nil, fmt.Errorf("error getting key: %w", err)
+	}
+	return addNewTinkKeyset(tinkKeyTemplates[templateName].templateFunc, allVersions.VersionList)
 }
